@@ -63,7 +63,11 @@ FRAME_EXTENSIONS = (".jpg", ".jpeg", ".png")
 SESSION_IDLE_S = 30      # no frames for this long -> session finalized
 CHECKPOINT_EVERY = 50    # frames between metrics.json uploads during a session
 BACKLOG_EVERY = 10       # frames between queue-depth checks (shown on the live page)
-RECEIVE_BATCH = 5        # SQS messages per receive (max 10)
+RECEIVE_BATCH = 10       # SQS messages per receive (max 10)
+# Live mode: a frame older than this is skipped if a newer one is already waiting, so the live
+# view stays current when processing can't keep up. Skipped frames are still archived in S3 --
+# `replay` processes everything. 0 = never skip (complete metrics, but the lag can grow).
+MAX_LAG_S = float(os.environ.get("LLD_MAX_LAG_S", 10))
 VISIBILITY_S = 120       # a received batch must be processed within this, or SQS re-delivers it
 
 
@@ -127,7 +131,7 @@ class SessionOutput:
         self.last_frame_at = time.time()
         self.finalized = False
 
-        self.frames, self.videos = self._load_existing() if resume else ([], [])
+        self.frames, self.videos, self.skipped = self._load_existing() if resume else ([], [], 0)
         self.seen = {f["key"] for f in self.frames}
         self.new_frames = 0
 
@@ -153,10 +157,10 @@ class SessionOutput:
             body = self.s3.get_object(Bucket=self.bucket, Key=f"{self.prefix}/metrics.json")["Body"].read()
         except Exception as e:
             if is_missing(e):
-                return [], []
+                return [], [], 0
             raise
         doc = json.loads(body)
-        return doc.get("frames", []), doc.get("videos", [])
+        return doc.get("frames", []), doc.get("videos", []), doc.get("frames_skipped", 0)
 
     def add(self, key, metrics, overlay, warped, **extra):
         """Record one processed frame. False if this key was already recorded (re-delivery)."""
@@ -183,6 +187,7 @@ class SessionOutput:
             "source": self.source,
             "frames_processed": len(self.frames),
             "frames_valid": sum(f["lane_valid"] for f in self.frames),
+            "frames_skipped": self.skipped,  # live mode, too old (see MAX_LAG_S); replay to fill in
             "videos": self.videos,
             "device": self.device,
             "updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -281,6 +286,14 @@ def queue_depth(sqs, queue_url):
         return None  # e.g. role lacks sqs:GetQueueAttributes -- not worth stopping for
 
 
+def newer_frame_waiting(sqs, queue_url, position, messages):
+    """True if a newer frame than messages[position] is already available: a later message in
+    this batch (FIFO, so later = newer), or anything still in the queue."""
+    if position < len(messages) - 1:
+        return True
+    return bool(queue_depth(sqs, queue_url))
+
+
 def run_live(s3, sqs, queue_url, model, device, work_dir, show=SHOW, live=None, max_receives=None):
     """Process frames from the SQS queue as they arrive, forever (or max_receives receive calls).
     Returns the last session's metrics doc."""
@@ -310,7 +323,7 @@ def run_live(s3, sqs, queue_url, model, device, work_dir, show=SHOW, live=None, 
                     stop = True
                 continue
 
-            for msg in messages:
+            for position, msg in enumerate(messages):
                 body = json.loads(msg["Body"])
                 bucket, key, session = body["bucket"], body["key"], body["session_start"]
 
@@ -329,6 +342,13 @@ def run_live(s3, sqs, queue_url, model, device, work_dir, show=SHOW, live=None, 
 
                 if key in current.seen:
                     print(f"already processed {key}, skipping re-delivery")
+                    sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=msg["ReceiptHandle"])
+                    continue
+
+                age = time.time() - body["frame_time"]
+                if MAX_LAG_S and age > MAX_LAG_S and newer_frame_waiting(sqs, queue_url, position, messages):
+                    current.skipped += 1
+                    print(f"{session}: skipping {PurePosixPath(key).name}, {age:.1f}s old and newer frames are waiting")
                     sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=msg["ReceiptHandle"])
                     continue
 
@@ -371,7 +391,7 @@ def run_live(s3, sqs, queue_url, model, device, work_dir, show=SHOW, live=None, 
                 if live:
                     live.update(overlay, warped, metrics, session=session, index=len(current.frames) - 1,
                                 total=None, frame=PurePosixPath(key).name, lag_s=round(lag, 2),
-                                timing=timing, backlog=backlog)
+                                timing=timing, backlog=backlog, skipped=current.skipped)
                 if show and show_frame(overlay, warped):
                     stop = True
                     break

@@ -76,6 +76,7 @@ async function poll() {
         <tr><td>road width</td><td>${fmt(x.road_width_m)} m</td></tr>
         <tr><td>valid</td><td class="${x.lane_valid ? "ok" : "bad"}">${x.lane_valid}</td></tr>
         <tr><td>status</td><td class="${cls}">${x.departure_text}</td></tr>
+        ${m.skipped ? `<tr><td>skipped</td><td class="bad">${m.skipped} frames (too old, replay to fill in)</td></tr>` : ""}
         ${m.backlog != null ? `<tr><td>backlog</td><td class="${m.backlog > 3 ? "bad" : "ok"}">${m.backlog} frames queued</td></tr>` : ""}
         ${m.timing ? `<tr><td>per frame</td><td>${fmt(m.timing.total_s)} s</td></tr>
         <tr><td>&nbsp; download</td><td>${fmt(m.timing.download_s)} s</td></tr>

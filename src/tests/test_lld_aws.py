@@ -7,6 +7,7 @@ blank images of the right sizes, so these run in milliseconds.
 import json
 import sys
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
@@ -79,6 +80,9 @@ class FakeSQS:
     def delete_message(self, QueueUrl, ReceiptHandle):
         self.deleted.append(ReceiptHandle)
 
+    def get_queue_attributes(self, QueueUrl, AttributeNames):
+        return {"Attributes": {"ApproximateNumberOfMessages": str(len(self.queue))}}
+
 
 def jpeg():
     return cv.imencode(".jpg", np.zeros((64, 64, 3), np.uint8))[1].tobytes()
@@ -93,7 +97,9 @@ def fake_process_frame(frame, model, device):
     return metrics, overlay, warped
 
 
-def live_msg(session, n, t0=1792505112.0):
+def live_msg(session, n, t0=None):
+    """Queue message for frame n; captured just now unless t0 (epoch seconds) is given."""
+    t0 = time.time() if t0 is None else t0
     return {"bucket": "b", "key": f"live/{session}/{n:04d}.jpg", "session_start": session,
             "frame_time": t0 + n * 0.5, "frame_seq": n}
 
@@ -224,6 +230,64 @@ class LiveTest(Base):
             self.run_live(s3, FakeSQS(msgs))
         # 2 checkpoints (after frames 2 and 4) + the final upload
         self.assertEqual(s3.puts.count("lld/S1/metrics.json"), 3)
+
+
+class StaleFrameTest(Base):
+    def run_live(self, s3, sqs, max_lag=10, receives=3):
+        with mock.patch.object(lld_aws, "SESSION_IDLE_S", 0), mock.patch.object(lld_aws, "MAX_LAG_S", max_lag):
+            lld_aws.run_live(s3, sqs, "q.fifo", None, "cpu", self.work.name, show=False, max_receives=receives)
+
+    def test_backlog_of_old_frames_is_skipped_down_to_the_newest(self):
+        msgs = [live_msg("S1", i, t0=time.time() - 100) for i in range(6)]
+        s3 = FakeS3({m["key"]: jpeg() for m in msgs})
+        sqs = FakeSQS(msgs)
+        self.run_live(s3, sqs)
+        doc = s3.metrics("S1")
+        self.assertEqual([f["frame_seq"] for f in doc["frames"]], [5])  # only the newest
+        self.assertEqual(doc["frames_skipped"], 5)
+        self.assertEqual(len(sqs.deleted), 6)
+
+    def test_old_frame_is_still_processed_when_nothing_newer_waits(self):
+        # e.g. the Pi's clock is off and every frame *looks* old -- must not skip everything
+        msgs = [live_msg("S1", 0, t0=time.time() - 100)]
+        s3 = FakeS3({m["key"]: jpeg() for m in msgs})
+        self.run_live(s3, FakeSQS(msgs))
+        doc = s3.metrics("S1")
+        self.assertEqual(doc["frames_processed"], 1)
+        self.assertEqual(doc["frames_skipped"], 0)
+
+    def test_old_frame_is_skipped_when_newer_ones_are_still_queued(self):
+        msgs = [live_msg("S1", i, t0=time.time() - 100) for i in range(12)]  # more than one batch
+        s3 = FakeS3({m["key"]: jpeg() for m in msgs})
+        self.run_live(s3, FakeSQS(msgs))
+        doc = s3.metrics("S1")
+        self.assertEqual([f["frame_seq"] for f in doc["frames"]], [11])
+        self.assertEqual(doc["frames_skipped"], 11)
+
+    def test_fresh_frames_are_never_skipped(self):
+        msgs = [live_msg("S1", i) for i in range(6)]
+        s3 = FakeS3({m["key"]: jpeg() for m in msgs})
+        self.run_live(s3, FakeSQS(msgs))
+        self.assertEqual(s3.metrics("S1")["frames_processed"], 6)
+
+    def test_max_lag_zero_processes_everything(self):
+        msgs = [live_msg("S1", i, t0=time.time() - 100) for i in range(6)]
+        s3 = FakeS3({m["key"]: jpeg() for m in msgs})
+        self.run_live(s3, FakeSQS(msgs), max_lag=0)
+        doc = s3.metrics("S1")
+        self.assertEqual(doc["frames_processed"], 6)
+        self.assertEqual(doc["frames_skipped"], 0)
+
+    def test_skipped_count_survives_a_restart(self):
+        old = [live_msg("S1", i, t0=time.time() - 100) for i in range(3)]
+        s3 = FakeS3({m["key"]: jpeg() for m in old})
+        self.run_live(s3, FakeSQS(old))
+        new = [live_msg("S1", 10)]
+        s3.objects[new[0]["key"]] = jpeg()
+        self.run_live(s3, FakeSQS(new))
+        doc = s3.metrics("S1")
+        self.assertEqual(doc["frames_skipped"], 2)
+        self.assertEqual(doc["frames_processed"], 2)
 
 
 if __name__ == "__main__":

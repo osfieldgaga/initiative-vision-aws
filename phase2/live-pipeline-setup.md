@@ -153,8 +153,13 @@ WantedBy=multi-user.target
 lld_aws resumes the session's metrics and starts a new video part.
 
 **Watch:** `ssh -L 8080:localhost:8080 ec2-user@<instance>` → http://localhost:8080. The `lag` row
-is capture-on-Pi → processed-on-EC2; if it keeps growing, processing is slower than 2 fps and the
-queue is backing up (nothing is lost, it just runs behind).
+is capture-on-Pi → processed-on-EC2, and the per-frame breakdown (download / inference / post-proc /
+outputs) shows where the time goes. Inference is ~4 s/frame on 1 vCPU, ~1 s on 4 -- use at least a
+`c8g.xlarge`; a `.medium` can't keep up with the Pi.
+
+If processing does fall behind, frames older than `LLD_MAX_LAG_S` (default 10 s) are skipped while
+newer ones are waiting, so the live view stays current. They're still archived in `live/<session>/`;
+`python lld_aws.py replay live/<session>/` processes every frame. `LLD_MAX_LAG_S=0` never skips.
 
 ## 6. Pi
 
