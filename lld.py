@@ -1,6 +1,5 @@
 import time
 
-import torch
 import cv2 as cv
 import numpy as np
 from pathlib import Path
@@ -47,11 +46,20 @@ DEGREE = 2                # polyfit degree, x = f(y)
 LOOKAHEAD_Y = 400         # BEV row where lane positions / offset are measured
 DEPARTURE_THRESHOLD = 0.4 # m; ~ (3.5 m lane - 1.8 m car) / 2 * 0.5
 
-DEFAULT_WEIGHTS = "data/weights/yolopv2.pt"
+DEFAULT_WEIGHTS = "data/weights/yolopv2_seg.onnx"  # cv.dnn; "data/weights/yolopv2.pt" = TorchScript
 
 
 def load_model(weights_path=DEFAULT_WEIGHTS, device=None):
-    """Load the TorchScript YOLOPv2 model. Returns (model, device)."""
+    """Load YOLOPv2. Returns (model, device).
+
+    .onnx -> OpenCV DNN (cv.dnn.Net, device "opencv-cpu"), made by src/scripts/export_onnx.py.
+    Anything else -> TorchScript on CUDA if available, else CPU. torch is only imported here,
+    so the ONNX path runs without it.
+    """
+    if str(weights_path).endswith(".onnx"):
+        return cv.dnn.readNetFromONNX(str(weights_path)), "opencv-cpu"
+
+    import torch
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = torch.jit.load(weights_path, map_location=device)
@@ -66,6 +74,48 @@ def _undistort_params(w, h):
     if (w, h) not in _undistort_cache:
         _undistort_cache[(w, h)] = cv.getOptimalNewCameraMatrix(imx219_matrix, imx219_dist, (w, h), 1, (w, h))
     return _undistort_cache[(w, h)]
+
+
+def _infer_dnn(net, bgr):
+    """OpenCV DNN forward pass. Returns (drivable mask, lane mask, seconds), masks 0/255 uint8."""
+    # BGR -> RGB, HWC -> NCHW, 0..255 -> 0..1 in one call
+    blob = cv.dnn.blobFromImage(bgr, scalefactor=1 / 255.0, swapRB=True)
+    t_infer = time.perf_counter()
+    net.setInput(blob)
+    da, ll = net.forward(["da", "ll"])
+    infer_s = time.perf_counter() - t_infer
+
+    da_mask = da[0].argmax(axis=0).astype(np.uint8) * 255
+    ll_mask = (ll[0, 0] > LANE_THRESHOLD).astype(np.uint8) * 255
+    return da_mask, ll_mask, infer_s
+
+
+def _infer_torch(model, device, bgr):
+    """TorchScript forward pass, same contract as _infer_dnn."""
+    import torch
+
+    rgb = cv.cvtColor(bgr, cv.COLOR_BGR2RGB)
+
+    # change frame to tensor for YOLO
+    img_tensor = rgb.transpose(2, 0, 1)
+    img_tensor = np.ascontiguousarray(img_tensor)
+    img_tensor = torch.from_numpy(img_tensor).to(device).float()
+    img_tensor /= 255.0
+
+    if img_tensor.ndimension() == 3:
+        img_tensor = img_tensor.unsqueeze(0)
+
+    with torch.no_grad():
+        t_infer = time.perf_counter()
+        detections, driveable_area, lld = model(img_tensor)
+        if img_tensor.is_cuda:
+            torch.cuda.synchronize()  # CUDA runs async; wait so the timing is real
+        infer_s = time.perf_counter() - t_infer
+
+    # Extract binary masks for drivable area and lanes
+    da_mask = driveable_area.argmax(dim=1)[0].cpu().numpy().astype(np.uint8) * 255
+    ll_mask = (lld[0, 0] > LANE_THRESHOLD).cpu().numpy().astype(np.uint8) * 255
+    return da_mask, ll_mask, infer_s
 
 
 def process_frame(frame, model, device):
@@ -92,27 +142,10 @@ def process_frame(frame, model, device):
     undistorted_r90 = cv.rotate(undistorted_frame, cv.ROTATE_90_CLOCKWISE)
 
     undistorted_resized = cv.resize(undistorted_r90, (MODEL_SIZE, MODEL_SIZE), interpolation=cv.INTER_AREA)
-    undistorted_rgb = cv.cvtColor(undistorted_resized, cv.COLOR_BGR2RGB)
-
-    # change frame to tensor for YOLO
-    img_tensor = undistorted_rgb.transpose(2, 0, 1)
-    img_tensor = np.ascontiguousarray(img_tensor)
-    img_tensor = torch.from_numpy(img_tensor).to(device).float()
-    img_tensor /= 255.0
-
-    if img_tensor.ndimension() == 3:
-        img_tensor = img_tensor.unsqueeze(0)
-
-    with torch.no_grad():
-        t_infer = time.perf_counter()
-        detections, driveable_area, lld = model(img_tensor)
-        if img_tensor.is_cuda:
-            torch.cuda.synchronize()  # CUDA runs async; wait so the timing is real
-        infer_s = time.perf_counter() - t_infer
-
-    # Extract binary masks for drivable area and lanes
-    da_mask = driveable_area.argmax(dim=1)[0].cpu().numpy().astype(np.uint8) * 255
-    ll_mask = (lld[0, 0] > LANE_THRESHOLD).cpu().numpy().astype(np.uint8) * 255
+    if isinstance(model, cv.dnn.Net):
+        da_mask, ll_mask, infer_s = _infer_dnn(model, undistorted_resized)
+    else:
+        da_mask, ll_mask, infer_s = _infer_torch(model, device, undistorted_resized)
 
     # Resize masks back to the frame size for overlay
     da_mask_resized = cv.resize(da_mask, (MODEL_SIZE, MODEL_SIZE), interpolation=cv.INTER_AREA)
@@ -181,8 +214,8 @@ def process_frame(frame, model, device):
                 right_x.extend(xs)
                 right_y.extend(ys)
 
-    left_x_ahead = 0
-    right_x_ahead  = 0
+    left_x_ahead = None   # lane x at LOOKAHEAD_Y, None if that side wasn't found
+    right_x_ahead = None
 
     warped = cv.warpPerspective(overlay, M, (canvas_w, canvas_h))
 
@@ -218,22 +251,30 @@ def process_frame(frame, model, device):
 
     both_lanes_present = left_coeff is not None and right_coeff is not None
 
-    lane_center_x = (left_x_ahead + right_x_ahead) / 2
-    lat_off_warped = (car_center[0] - lane_center_x) / scale
+    def to_m(x):
+        return None if x is None else float((x - canvas_w / 2) / scale)
 
-    cv.putText(overlay, f"Lane center offset: {lat_off_warped:.2f} m", (20, 20), cv.FONT_HERSHEY_SIMPLEX, 1, (0,255,0))
+    def fmt_m(v):
+        return "n/a" if v is None else f"{v:.2f} m"
 
-    left_lane_offset_from_center = (left_x_ahead - canvas_w / 2) / scale
-    right_lane_offset_from_center = (right_x_ahead - canvas_w / 2) / scale
+    # each side's offset needs that side; the center offset and width need both. A missing side
+    # used to count as x=0 (the canvas edge), which showed up as a ~-4 m offset.
+    left_lane_offset_from_center = to_m(left_x_ahead)
+    right_lane_offset_from_center = to_m(right_x_ahead)
+    lane_center_x = lat_off_warped = lane_width = None
+    if both_lanes_present:
+        lane_center_x = (left_x_ahead + right_x_ahead) / 2
+        lat_off_warped = float((car_center[0] - lane_center_x) / scale)
+        lane_width = abs(left_lane_offset_from_center) + abs(right_lane_offset_from_center)
 
-    lane_width = abs(left_lane_offset_from_center) + abs(right_lane_offset_from_center)
+    cv.putText(overlay, f"Lane center offset: {fmt_m(lat_off_warped)}", (20, 20), cv.FONT_HERSHEY_SIMPLEX, 1, (0,255,0))
 
     # bool(): `and` can hand back a numpy.bool_, which json can't serialize
-    lane_valid = bool((abs(a_left - a_right) < 0.1) and lane_width < 6 and both_lanes_present)
+    lane_valid = bool(both_lanes_present and abs(a_left - a_right) < 0.1 and lane_width < 6)
     cv.putText(overlay, f"Valid lanes: {lane_valid}", (20, 110), cv.FONT_HERSHEY_SIMPLEX, 1, (0,0,255) if not lane_valid else (0,255,0))
 
-    cv.putText(overlay, f"L off: {left_lane_offset_from_center:.2f} m | R off: {right_lane_offset_from_center:.2f} m", (20, 50), cv.FONT_HERSHEY_SIMPLEX, 1, (0,255,0))
-    cv.putText(overlay, f"Road width: {lane_width:.2f} m", (20, 80), cv.FONT_HERSHEY_SIMPLEX, 1, (0,0,255))
+    cv.putText(overlay, f"L off: {fmt_m(left_lane_offset_from_center)} | R off: {fmt_m(right_lane_offset_from_center)}", (20, 50), cv.FONT_HERSHEY_SIMPLEX, 1, (0,255,0))
+    cv.putText(overlay, f"Road width: {fmt_m(lane_width)}", (20, 80), cv.FONT_HERSHEY_SIMPLEX, 1, (0,0,255))
 
     # lane departure: |offset| beyond threshold = departing, sign gives the side
     departure = None
@@ -258,14 +299,16 @@ def process_frame(frame, model, device):
     cv.drawMarker(warped, (int(canvas_w / 2), LOOKAHEAD_Y), color=(128, 128, 128), markerType=cv.MARKER_CROSS, markerSize=20, thickness=2)
 
     # lane center both at the lookahead row and at the hood
-    cv.drawMarker(warped, (int(lane_center_x), LOOKAHEAD_Y), color=(128, 255, 128), markerType=cv.MARKER_CROSS, markerSize=20, thickness=2)
-    cv.drawMarker(warped, (int(lane_center_x), 700), color=(128, 255, 128), markerType=cv.MARKER_CROSS, markerSize=20, thickness=2)
+    if lane_center_x is not None:
+        cv.drawMarker(warped, (int(lane_center_x), LOOKAHEAD_Y), color=(128, 255, 128), markerType=cv.MARKER_CROSS, markerSize=20, thickness=2)
+        cv.drawMarker(warped, (int(lane_center_x), 700), color=(128, 255, 128), markerType=cv.MARKER_CROSS, markerSize=20, thickness=2)
 
     metrics = {
-        "offset_m": float(lat_off_warped),
-        "left_off_m": float(left_lane_offset_from_center),
-        "right_off_m": float(right_lane_offset_from_center),
-        "road_width_m": float(lane_width),
+        # None when the lane line(s) they need weren't detected
+        "offset_m": lat_off_warped,
+        "left_off_m": left_lane_offset_from_center,
+        "right_off_m": right_lane_offset_from_center,
+        "road_width_m": lane_width,
         "left_present": left_coeff is not None,
         "right_present": right_coeff is not None,
         "left_coeff": [float(c) for c in left_coeff] if left_coeff is not None else None,
@@ -280,10 +323,14 @@ def process_frame(frame, model, device):
 
 
 def format_metrics(metrics):
+    def m(key):
+        v = metrics[key]
+        return "n/a" if v is None else f"{v:.2f} m"
+
     return (
-        f"Offset: {metrics['offset_m']:.2f} m | "
-        f"L off: {metrics['left_off_m']:.2f} m | R off: {metrics['right_off_m']:.2f} m | "
-        f"Road width: {metrics['road_width_m']:.2f} m | "
+        f"Offset: {m('offset_m')} | "
+        f"L off: {m('left_off_m')} | R off: {m('right_off_m')} | "
+        f"Road width: {m('road_width_m')} | "
         f"Valid: {metrics['lane_valid']} | "
         f"{metrics['departure_text']}"
     )

@@ -40,7 +40,6 @@ from pathlib import Path, PurePosixPath
 import boto3
 import cv2 as cv
 import numpy as np
-import torch
 
 import lld
 from live_view import LiveView
@@ -51,7 +50,7 @@ BUCKET = "initiative-vision-1"
 QUEUE_URL = os.environ.get("LLD_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/686584420503/lld-frames.fifo")  # SQS queue the Lambda feeds
 FRAMES_PREFIX = "live/<session_start>/"  # default for replay mode
 OUTPUT_PREFIX = "lld"
-WEIGHTS_PATH = lld.DEFAULT_WEIGHTS
+WEIGHTS_PATH = os.environ.get("LLD_WEIGHTS", lld.DEFAULT_WEIGHTS)  # .onnx -> cv.dnn, .pt -> TorchScript
 REGION = "us-east-1"
 
 FPS = 2.0
@@ -441,7 +440,12 @@ def main(argv=None):
 
     s3 = boto3.client("s3", region_name=REGION)
     model, device = lld.load_model(WEIGHTS_PATH)
-    print(f"model on {device}, torch threads {torch.get_num_threads()}, cpus {os.cpu_count()}, display: {SHOW}")
+    if isinstance(model, cv.dnn.Net):
+        threads = f"OpenCV {cv.__version__}, cv threads {cv.getNumThreads()}"
+    else:
+        import torch
+        threads = f"torch threads {torch.get_num_threads()}"
+    print(f"model {WEIGHTS_PATH} on {device}, {threads}, cpus {os.cpu_count()}, display: {SHOW}")
 
     live = None
     if LIVE_PORT:

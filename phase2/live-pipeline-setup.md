@@ -127,10 +127,18 @@ metrics.json for this session?" check can't tell the difference.
 
 ## 5. Run it on the instance
 
-Copy over `lld.py`, `lld_aws.py`, `live_view.py` and `data/weights/yolopv2.pt`, then in COOL's venv
-(don't `pip install opencv-python` there -- it would shadow COOL's OpenCV):
+The model runs on OpenCV's DNN module (`cv.dnn`) from an ONNX file, so the instance doesn't need
+torch. Make the ONNX once on a machine that has torch:
 ```
-pip install boto3 torch
+python src/scripts/export_onnx.py                                   # -> data/weights/yolopv2_seg.onnx
+python src/scripts/compare_onnx.py <some frames dir>                # should report IoU 1.0000
+```
+Copy over `lld.py`, `lld_aws.py`, `live_view.py` and `data/weights/yolopv2_seg.onnx`. On the instance,
+check that COOL's OpenCV is 5.x and has the DNN module:
+`python -c "import cv2; print(cv2.__version__); cv2.dnn.readNetFromONNX('data/weights/yolopv2_seg.onnx')"`.
+Then in COOL's venv (don't `pip install opencv-python` there -- it would shadow COOL's OpenCV):
+```
+pip install boto3
 LLD_QUEUE_URL=https://sqs.us-east-1.amazonaws.com/<account-id>/lld-frames.fifo python lld_aws.py live
 ```
 To keep it running after you log out and across reboots, a systemd unit
@@ -154,8 +162,9 @@ lld_aws resumes the session's metrics and starts a new video part.
 
 **Watch:** `ssh -L 8080:localhost:8080 ec2-user@<instance>` → http://localhost:8080. The `lag` row
 is capture-on-Pi → processed-on-EC2, and the per-frame breakdown (download / inference / post-proc /
-outputs) shows where the time goes. Inference is ~4 s/frame on 1 vCPU, ~1 s on 4 -- use at least a
-`c8g.xlarge`; a `.medium` can't keep up with the Pi.
+outputs) shows where the time goes. Inference (TorchScript) was ~4 s/frame on 1 vCPU, ~1 s on 4 -- use at least a
+`c8g.xlarge`; a `.medium` can't keep up with the Pi. `LLD_WEIGHTS=data/weights/yolopv2.pt` switches back
+to TorchScript (needs `pip install torch`) for comparisons.
 
 If processing does fall behind, frames older than `LLD_MAX_LAG_S` (default 10 s) are skipped while
 newer ones are waiting, so the live view stays current. They're still archived in `live/<session>/`;

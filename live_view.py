@@ -43,7 +43,8 @@ PAGE = """<!doctype html>
 <script>
 const history = [];
 let lastSeq = -1, lastDone = false, lastSession = null;
-const fmt = v => (typeof v === "number") ? v.toFixed(2) : String(v);
+const fmt = v => (typeof v === "number") ? v.toFixed(2) : (v == null ? "n/a" : String(v));
+const fmtM = v => v == null ? "n/a" : fmt(v) + " m";
 
 function drawPlot() {
   const c = document.getElementById("plot"), g = c.getContext("2d");
@@ -53,6 +54,7 @@ function drawPlot() {
   g.strokeStyle = "#444";
   for (const v of [0, __DEP__, -__DEP__]) { g.beginPath(); g.moveTo(0, y(v)); g.lineTo(c.width, y(v)); g.stroke(); }
   history.forEach((p, i) => {
+    if (p.offset == null) return;  // lane(s) not detected, nothing to plot
     g.fillStyle = !p.valid ? "#666" : (p.departure ? "#f55" : "#5d5");
     g.fillRect(i * c.width / 200, y(p.offset) - 1, 2, 2);
   });
@@ -71,9 +73,9 @@ async function poll() {
         <tr><td>frame</td><td>${m.index}${m.total != null ? " / " + m.total : ""}</td></tr>
         <tr><td>file</td><td>${m.frame}</td></tr>
         ${m.lag_s != null ? `<tr><td>lag</td><td class="${m.lag_s > 5 ? "bad" : "ok"}">${fmt(m.lag_s)} s</td></tr>` : ""}
-        <tr><td>offset</td><td>${fmt(x.offset_m)} m</td></tr>
-        <tr><td>L / R off</td><td>${fmt(x.left_off_m)} / ${fmt(x.right_off_m)} m</td></tr>
-        <tr><td>road width</td><td>${fmt(x.road_width_m)} m</td></tr>
+        <tr><td>offset</td><td>${fmtM(x.offset_m)}</td></tr>
+        <tr><td>L / R off</td><td>${fmtM(x.left_off_m)} / ${fmtM(x.right_off_m)}</td></tr>
+        <tr><td>road width</td><td>${fmtM(x.road_width_m)}</td></tr>
         <tr><td>valid</td><td class="${x.lane_valid ? "ok" : "bad"}">${x.lane_valid}</td></tr>
         <tr><td>status</td><td class="${cls}">${x.departure_text}</td></tr>
         ${m.skipped ? `<tr><td>skipped</td><td class="bad">${m.skipped} frames (too old, replay to fill in)</td></tr>` : ""}

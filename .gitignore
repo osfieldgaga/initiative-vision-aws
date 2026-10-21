@@ -1,2 +1,3 @@
 .venv/
 /data/weights/yolopv2.pt
+/data/weights/yolopv2_seg.onnx

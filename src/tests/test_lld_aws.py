@@ -300,5 +300,16 @@ class StaleFrameTest(Base):
         self.assertEqual(doc["frames_processed"], 2)
 
 
+class FormatMetricsTest(unittest.TestCase):
+    def test_missing_lanes_show_na_not_a_number(self):
+        # a missing side used to come out as a ~-4 m offset; now the values it needs are None
+        metrics = {"offset_m": None, "left_off_m": None, "right_off_m": 1.9, "road_width_m": None,
+                   "lane_valid": False, "departure_text": "Departure: n/a"}
+        text = lld.format_metrics(metrics)
+        self.assertIn("Offset: n/a", text)
+        self.assertIn("L off: n/a | R off: 1.90 m", text)
+        self.assertIn("Road width: n/a", text)
+
+
 if __name__ == "__main__":
     unittest.main()
