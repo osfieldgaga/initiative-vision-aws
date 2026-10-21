@@ -42,7 +42,7 @@ PAGE = """<!doctype html>
 </div>
 <script>
 const history = [];
-let lastSeq = -1, lastDone = false;
+let lastSeq = -1, lastDone = false, lastSession = null;
 const fmt = v => (typeof v === "number") ? v.toFixed(2) : String(v);
 
 function drawPlot() {
@@ -67,14 +67,17 @@ async function poll() {
       const x = m.metrics;
       const cls = !x.lane_valid ? "na" : (x.departure ? "bad" : "ok");
       document.getElementById("m").innerHTML = `
-        <tr><td>frame</td><td>${m.index} / ${m.total}</td></tr>
+        <tr><td>session</td><td>${m.session ?? ""}</td></tr>
+        <tr><td>frame</td><td>${m.index}${m.total != null ? " / " + m.total : ""}</td></tr>
         <tr><td>file</td><td>${m.frame}</td></tr>
+        ${m.lag_s != null ? `<tr><td>lag</td><td class="${m.lag_s > 5 ? "bad" : "ok"}">${fmt(m.lag_s)} s</td></tr>` : ""}
         <tr><td>offset</td><td>${fmt(x.offset_m)} m</td></tr>
         <tr><td>L / R off</td><td>${fmt(x.left_off_m)} / ${fmt(x.right_off_m)} m</td></tr>
         <tr><td>road width</td><td>${fmt(x.road_width_m)} m</td></tr>
         <tr><td>valid</td><td class="${x.lane_valid ? "ok" : "bad"}">${x.lane_valid}</td></tr>
         <tr><td>status</td><td class="${cls}">${x.departure_text}</td></tr>
         <tr><td>run</td><td>${m.done ? "finished" : "running"}</td></tr>`;
+      if (m.session !== lastSession) { history.length = 0; lastSession = m.session; }
       if (isNewFrame) {
         history.push({offset: x.offset_m, valid: x.lane_valid, departure: x.departure});
         if (history.length > 200) history.shift();

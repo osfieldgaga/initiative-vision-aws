@@ -1,26 +1,35 @@
-"""Run the lld.py lane pipeline on a session's frames stored in S3.
+"""Run the lld.py lane pipeline in the cloud on frames stored in S3.
 
-Reads frames from s3://BUCKET/FRAMES_PREFIX, runs lld.process_frame on each,
-and uploads per-session results to:
+Two modes:
 
-    s3://BUCKET/OUTPUT_PREFIX/<session start timestamp>/overlay.mp4
-    s3://BUCKET/OUTPUT_PREFIX/<session start timestamp>/bev.mp4
-    s3://BUCKET/OUTPUT_PREFIX/<session start timestamp>/metrics.json
+    python lld_aws.py live            # default: process frames as the Pi uploads them
+    python lld_aws.py replay <prefix> # re-run a stored session, e.g. live/20261020T140512Z/
+                                      # or sessions/20261001T170034Z-d015/frames/
 
-OUTPUT_PREFIX must not be under sessions/ -- that prefix fires the on-upload Lambda.
+Live mode: the Pi overwrites live/latest_frame.jpg; the on_live_frame Lambda archives each
+upload to live/<session start>/<frame time>.jpg and queues its key in SQS. This script
+reads that queue, processes each frame, and writes per-session results:
 
-Credentials: on EC2 attach an instance role; boto3 picks it up automatically. It needs
-s3:ListBucket on arn:aws:s3:::BUCKET, s3:GetObject on FRAMES_PREFIX*, s3:PutObject on OUTPUT_PREFIX/*.
+    s3://BUCKET/OUTPUT_PREFIX/<session start>/overlay.mp4   (overlay_part2.mp4, ... if resumed)
+    s3://BUCKET/OUTPUT_PREFIX/<session start>/bev.mp4
+    s3://BUCKET/OUTPUT_PREFIX/<session start>/metrics.json  (checkpointed every CHECKPOINT_EVERY frames)
 
-Watching it live: the script serves the overlay, BEV and metrics on 127.0.0.1:LIVE_PORT
+A session is finalized (videos uploaded) when frames from a new session arrive, or after
+SESSION_IDLE_S without any frame. Restarting this script mid-session resumes it: metrics are
+appended and the videos continue as a new part. Setup steps: phase2/live-pipeline-setup.md.
+
+Watching it: the script serves the overlay, BEV and metrics on 127.0.0.1:LIVE_PORT
 (see live_view.py). From your laptop:
 
     ssh -L 8080:localhost:8080 ec2-user@<server>
     open http://localhost:8080
 
-LIVE_PORT=0 disables it. LIVE_HOLD=1 keeps the page up after the run until Ctrl+C.
+LIVE_PORT=0 disables it. LIVE_HOLD=1 keeps the page up after a replay until Ctrl+C.
 OpenCV windows still open if a display is available (DISPLAY set), otherwise headless.
+
+Credentials: on EC2 attach an instance role; boto3 picks it up automatically.
 """
+import argparse
 import json
 import os
 import tempfile
@@ -36,9 +45,10 @@ import lld
 from live_view import LiveView
 
 
-## Config -- fill these in
-BUCKET = "<your-bucket-name>"
-FRAMES_PREFIX = "sessions/<session_id>/frames/"
+## Config
+BUCKET = "initiative-vision-1"
+QUEUE_URL = os.environ.get("LLD_QUEUE_URL", "<your-queue-url>")  # SQS queue the Lambda feeds
+FRAMES_PREFIX = "live/<session_start>/"  # default for replay mode
 OUTPUT_PREFIX = "lld"
 WEIGHTS_PATH = lld.DEFAULT_WEIGHTS
 REGION = "us-east-1"
@@ -49,6 +59,13 @@ LIVE_PORT = int(os.environ.get("LIVE_PORT", 8080))  # 0 = no live view
 LIVE_HOLD = bool(os.environ.get("LIVE_HOLD"))
 FRAME_EXTENSIONS = (".jpg", ".jpeg", ".png")
 
+SESSION_IDLE_S = 30      # no frames for this long -> session finalized
+CHECKPOINT_EVERY = 50    # frames between metrics.json uploads during a session
+RECEIVE_BATCH = 5        # SQS messages per receive (max 10)
+VISIBILITY_S = 120       # a received batch must be processed within this, or SQS re-delivers it
+
+
+## S3 helpers
 
 def list_frame_keys(s3, bucket, prefix):
     """All frame keys under prefix, sorted (frame names sort chronologically).
@@ -68,79 +85,105 @@ def read_frame(s3, bucket, key):
     return cv.imdecode(np.frombuffer(body, np.uint8), cv.IMREAD_COLOR)
 
 
+def is_missing(error):
+    """True if a boto3 error means 'object does not exist'."""
+    code = getattr(error, "response", {}).get("Error", {}).get("Code")
+    return code in ("NoSuchKey", "404", "NotFound")
+
+
 def session_id(frames_prefix):
-    """sessions/20261001T170034Z-d015/frames/ -> 20261001T170034Z-d015"""
-    return PurePosixPath(frames_prefix.rstrip("/")).parent.name
+    """sessions/20261001T170034Z-d015/frames/ -> 20261001T170034Z-d015
+       live/20261020T140512Z/                -> 20261020T140512Z"""
+    path = PurePosixPath(frames_prefix.rstrip("/"))
+    return path.parent.name if path.name == "frames" else path.name
 
 
-def session_timestamp(frames_prefix):
-    """sessions/20261001T170034Z-d015/frames/ -> 20261001T170034Z (when the session started)"""
-    return session_id(frames_prefix).split("-")[0]
+def session_timestamp(session):
+    """20261001T170034Z-d015 -> 20261001T170034Z (when the session started)"""
+    return session.split("-")[0]
 
 
-def output_key(name, frames_prefix, output_prefix=OUTPUT_PREFIX):
-    return f"{output_prefix}/{session_timestamp(frames_prefix)}/{name}"
+## Per-session outputs
 
+class SessionOutput:
+    """Videos + metrics for one session, uploaded to OUTPUT_PREFIX/<session start>/.
 
-def run(s3, bucket, frames_prefix, model, device, work_dir, show=SHOW, live=None):
-    """Process every frame under frames_prefix and upload the videos + metrics.
-    Returns the metrics document that was uploaded."""
-    keys = list_frame_keys(s3, bucket, frames_prefix)
-    if not keys:
-        raise SystemExit(f"no frames found under s3://{bucket}/{frames_prefix}")
-    print(f"{len(keys)} frames under s3://{bucket}/{frames_prefix}")
+    resume=True picks up an existing metrics.json (live mode after a restart): known frames
+    are skipped and the videos continue as overlay_partN.mp4 / bev_partN.mp4.
+    resume=False starts over and overwrites (replay mode).
+    """
 
-    work_dir = Path(work_dir)
-    overlay_path = work_dir / "overlay.mp4"
-    bev_path = work_dir / "bev.mp4"
+    def __init__(self, s3, bucket, session, source, device, work_dir, resume=True):
+        self.s3 = s3
+        self.bucket = bucket
+        self.session = session
+        self.folder = session_timestamp(session)
+        self.prefix = f"{OUTPUT_PREFIX}/{self.folder}"
+        self.source = source
+        self.device = str(device)
+        self.started = time.time()
+        self.last_frame_at = time.time()
+        self.finalized = False
 
-    fourcc = cv.VideoWriter_fourcc(*'mp4v')
-    out = cv.VideoWriter(str(overlay_path), fourcc, FPS, (lld.MODEL_SIZE, lld.MODEL_SIZE))  # size must match every frame you write, exactly
-    bev = cv.VideoWriter(str(bev_path), fourcc, FPS, (lld.canvas_w, lld.canvas_h))
+        self.frames, self.videos = self._load_existing() if resume else ([], [])
+        self.seen = {f["key"] for f in self.frames}
+        self.new_frames = 0
 
-    frames = []
-    started = time.time()
-    try:
-        for index, key in enumerate(keys):
-            frame = read_frame(s3, bucket, key)
-            if frame is None:
-                print(f"Frame {index}: could not decode {key}, skipping")
-                continue
+        part = len(self.videos) + 1
+        suffix = "" if part == 1 else f"_part{part}"
+        local_dir = Path(work_dir) / self.folder
+        local_dir.mkdir(parents=True, exist_ok=True)
+        self.video_paths = {
+            "overlay": local_dir / f"overlay{suffix}.mp4",
+            "bev": local_dir / f"bev{suffix}.mp4",
+        }
+        fourcc = cv.VideoWriter_fourcc(*'mp4v')
+        # size must match every frame you write, exactly
+        self.writers = {
+            "overlay": cv.VideoWriter(str(self.video_paths["overlay"]), fourcc, FPS, (lld.MODEL_SIZE, lld.MODEL_SIZE)),
+            "bev": cv.VideoWriter(str(self.video_paths["bev"]), fourcc, FPS, (lld.canvas_w, lld.canvas_h)),
+        }
+        if self.frames:
+            print(f"session {session}: resuming after {len(self.frames)} frames, video part {part}")
 
-            metrics, overlay, warped = lld.process_frame(frame, model, device)
-            out.write(overlay)
-            bev.write(warped)
+    def _load_existing(self):
+        try:
+            body = self.s3.get_object(Bucket=self.bucket, Key=f"{self.prefix}/metrics.json")["Body"].read()
+        except Exception as e:
+            if is_missing(e):
+                return [], []
+            raise
+        doc = json.loads(body)
+        return doc.get("frames", []), doc.get("videos", [])
 
-            frames.append({"index": index, "key": key, "frame": PurePosixPath(key).name, **metrics})
-            print(f"Frame {index}/{len(keys)} | {lld.format_metrics(metrics)}")
+    def add(self, key, metrics, overlay, warped, **extra):
+        """Record one processed frame. False if this key was already recorded (re-delivery)."""
+        if key in self.seen:
+            return False
+        self.seen.add(key)
+        self.writers["overlay"].write(overlay)
+        self.writers["bev"].write(warped)
+        self.frames.append({"index": len(self.frames), "key": key, "frame": PurePosixPath(key).name,
+                            **extra, **metrics})
+        self.new_frames += 1
+        self.last_frame_at = time.time()
+        if self.new_frames % CHECKPOINT_EVERY == 0:
+            try:
+                self.upload_metrics()
+            except Exception as e:
+                print(f"checkpoint upload failed, retrying at the next one: {e}")  # boto3 already retried
+        return True
 
-            if live:
-                live.update(overlay, warped, metrics, index=index, total=len(keys), frame=PurePosixPath(key).name)
-
-            if show:
-                cv.imshow('YOLOPv2 Panoptic Perception Overlay', overlay)
-                cv.imshow("Bird Eye's View - Lane Mask", warped)
-                if cv.waitKey(1) & 0xFF == ord('q'):
-                    print("stopped early with q, uploading what was processed")
-                    break
-    finally:
-        # mp4 is only finalized on release -- uploading before this gives an unplayable file
-        out.release()
-        bev.release()
-        if show:
-            cv.destroyAllWindows()
-        if live:
-            live.finish()
-
-        doc = {
-            "session_id": session_id(frames_prefix),
-            "session_start": session_timestamp(frames_prefix),
-            "source": f"s3://{bucket}/{frames_prefix}",
-            "frames_total": len(keys),
-            "frames_processed": len(frames),
-            "frames_valid": sum(f["lane_valid"] for f in frames),
-            "processing_seconds": round(time.time() - started, 2),
-            "device": str(device),
+    def doc(self):
+        return {
+            "session_id": self.session,
+            "session_start": self.folder,
+            "source": self.source,
+            "frames_processed": len(self.frames),
+            "frames_valid": sum(f["lane_valid"] for f in self.frames),
+            "videos": self.videos,
+            "device": self.device,
+            "updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "params": {
                 "lane_threshold": lld.LANE_THRESHOLD,
                 "tolerance_px": lld.TOLERANCE,
@@ -149,33 +192,186 @@ def run(s3, bucket, frames_prefix, model, device, work_dir, show=SHOW, live=None
                 "departure_threshold_m": lld.DEPARTURE_THRESHOLD,
                 "fps": FPS,
             },
-            "frames": frames,
+            "frames": self.frames,
         }
 
-        if frames:
-            upload(s3, bucket, frames_prefix, overlay_path, bev_path, doc)
-        else:
-            print("no frames processed, nothing uploaded")
+    def upload_metrics(self):
+        key = f"{self.prefix}/metrics.json"
+        self.s3.put_object(Bucket=self.bucket, Key=key, Body=json.dumps(self.doc(), indent=2).encode(),
+                           ContentType="application/json")
+        return key
 
-    return doc
+    def finalize(self):
+        """Close the videos (mp4 is only playable after release) and upload everything."""
+        if self.finalized:
+            return
+        self.finalized = True
+        for writer in self.writers.values():
+            writer.release()
+
+        if not self.new_frames:
+            print(f"session {self.session}: no new frames, nothing uploaded")
+            return
+
+        part = {"frames": self.new_frames}
+        for name, path in self.video_paths.items():
+            key = f"{self.prefix}/{path.name}"
+            self.s3.upload_file(str(path), self.bucket, key, ExtraArgs={"ContentType": "video/mp4"})
+            part[name] = key
+            print(f"uploaded s3://{self.bucket}/{key}")
+        self.videos.append(part)
+        print(f"uploaded s3://{self.bucket}/{self.upload_metrics()}")
 
 
-def upload(s3, bucket, frames_prefix, overlay_path, bev_path, doc):
-    for path in (overlay_path, bev_path):
-        key = output_key(path.name, frames_prefix)
-        s3.upload_file(str(path), bucket, key, ExtraArgs={"ContentType": "video/mp4"})
-        print(f"uploaded s3://{bucket}/{key}")
+## Display helpers
 
-    key = output_key("metrics.json", frames_prefix)
-    s3.put_object(Bucket=bucket, Key=key, Body=json.dumps(doc, indent=2).encode(), ContentType="application/json")
-    print(f"uploaded s3://{bucket}/{key}")
+def show_frame(overlay, warped):
+    """OpenCV windows (needs a display). True if q was pressed."""
+    cv.imshow('YOLOPv2 Panoptic Perception Overlay', overlay)
+    cv.imshow("Bird Eye's View - Lane Mask", warped)
+    return cv.waitKey(1) & 0xFF == ord('q')
 
 
-def main():
-    if "<" in BUCKET or "<" in FRAMES_PREFIX:
-        raise SystemExit("fill in BUCKET and FRAMES_PREFIX at the top of lld_aws.py first")
-    if FRAMES_PREFIX.startswith(OUTPUT_PREFIX.rstrip("/") + "/") or OUTPUT_PREFIX.startswith("sessions"):
-        raise SystemExit("OUTPUT_PREFIX must be separate from sessions/ (it would re-trigger the on-upload Lambda)")
+## Modes
+
+def run_replay(s3, bucket, frames_prefix, model, device, work_dir, show=SHOW, live=None):
+    """Process every frame under frames_prefix in order. Returns the uploaded metrics doc."""
+    keys = list_frame_keys(s3, bucket, frames_prefix)
+    if not keys:
+        raise SystemExit(f"no frames found under s3://{bucket}/{frames_prefix}")
+    print(f"{len(keys)} frames under s3://{bucket}/{frames_prefix}")
+
+    out = SessionOutput(s3, bucket, session_id(frames_prefix), f"s3://{bucket}/{frames_prefix}",
+                        device, work_dir, resume=False)
+    try:
+        for index, key in enumerate(keys):
+            frame = read_frame(s3, bucket, key)
+            if frame is None:
+                print(f"Frame {index}: could not decode {key}, skipping")
+                continue
+
+            metrics, overlay, warped = lld.process_frame(frame, model, device)
+            out.add(key, metrics, overlay, warped)
+            print(f"Frame {index}/{len(keys)} | {lld.format_metrics(metrics)}")
+
+            if live:
+                live.update(overlay, warped, metrics, session=out.session, index=index, total=len(keys),
+                            frame=PurePosixPath(key).name)
+            if show and show_frame(overlay, warped):
+                print("stopped early with q, uploading what was processed")
+                break
+    finally:
+        # also runs on a crash or Ctrl+C, so partial results still get uploaded
+        out.finalize()
+        if show:
+            cv.destroyAllWindows()
+        if live:
+            live.finish()
+    return out.doc()
+
+
+def run_live(s3, sqs, queue_url, model, device, work_dir, show=SHOW, live=None, max_receives=None):
+    """Process frames from the SQS queue as they arrive, forever (or max_receives receive calls).
+    Returns the last session's metrics doc."""
+    current = None
+    receives = 0
+    stop = False
+    print(f"waiting for frames on {queue_url}")
+
+    try:
+        while not stop and (max_receives is None or receives < max_receives):
+            receives += 1
+            resp = sqs.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=RECEIVE_BATCH,
+                                       WaitTimeSeconds=1 if show else 20,  # long poll: fewer empty (billed) receives
+                                       VisibilityTimeout=VISIBILITY_S)
+            messages = resp.get("Messages", [])
+
+            if not messages:
+                if current and time.time() - current.last_frame_at > SESSION_IDLE_S:
+                    print(f"session {current.session}: no frames for {SESSION_IDLE_S}s, finalizing")
+                    current.finalize()
+                    current = None
+                    if live:
+                        live.finish()
+                if show and cv.waitKey(1) & 0xFF == ord('q'):
+                    stop = True
+                continue
+
+            for msg in messages:
+                body = json.loads(msg["Body"])
+                bucket, key, session = body["bucket"], body["key"], body["session_start"]
+
+                if current is None or current.session != session:
+                    if current:
+                        current.finalize()
+                        current = None
+                    try:
+                        current = SessionOutput(s3, bucket, session, f"s3://{bucket}/live/{session}/",
+                                                device, work_dir, resume=True)
+                    except Exception as e:
+                        # couldn't check for an existing metrics.json, so can't safely resume yet;
+                        # leave the message queued and retry after VISIBILITY_S
+                        print(f"session {session}: could not start, will retry: {e}")
+                        continue
+
+                if key in current.seen:
+                    print(f"already processed {key}, skipping re-delivery")
+                    sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=msg["ReceiptHandle"])
+                    continue
+
+                try:
+                    frame = read_frame(s3, bucket, key)
+                except Exception as e:
+                    if not is_missing(e):
+                        # transient (network/throttling): leave it, SQS re-delivers after VISIBILITY_S
+                        print(f"could not read {key}, will retry: {e}")
+                        continue
+                    frame = None
+                if frame is None:
+                    print(f"{key} missing or undecodable, dropping")
+                    sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=msg["ReceiptHandle"])
+                    continue
+
+                metrics, overlay, warped = lld.process_frame(frame, model, device)
+                lag = time.time() - body["frame_time"]  # capture on the Pi -> processed here
+                current.add(key, metrics, overlay, warped, frame_time=body["frame_time"],
+                            frame_seq=body.get("frame_seq"), lag_s=round(lag, 3))
+                sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=msg["ReceiptHandle"])
+
+                print(f"{session} #{len(current.frames) - 1} | lag {lag:.1f}s | {lld.format_metrics(metrics)}")
+                if live:
+                    live.update(overlay, warped, metrics, session=session, index=len(current.frames) - 1,
+                                total=None, frame=PurePosixPath(key).name, lag_s=round(lag, 2))
+                if show and show_frame(overlay, warped):
+                    stop = True
+                    break
+    finally:
+        # Ctrl+C or crash: upload what this session has so far; unprocessed messages stay queued
+        if current:
+            current.finalize()
+        if show:
+            cv.destroyAllWindows()
+        if live:
+            live.finish()
+    return current.doc() if current else None
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="lane pipeline on frames in S3")
+    sub = parser.add_subparsers(dest="mode")
+    sub.add_parser("live", help="process frames from the SQS queue as they arrive (default)")
+    replay = sub.add_parser("replay", help="process a stored session")
+    replay.add_argument("prefix", nargs="?", default=FRAMES_PREFIX,
+                        help="e.g. live/20261020T140512Z/ or sessions/<id>/frames/")
+    args = parser.parse_args(argv)
+    mode = args.mode or "live"
+
+    if OUTPUT_PREFIX.rstrip("/") in ("sessions", "live"):
+        raise SystemExit("OUTPUT_PREFIX must be separate from sessions/ and live/")
+    if mode == "live" and "<" in QUEUE_URL:
+        raise SystemExit("set LLD_QUEUE_URL (or QUEUE_URL in lld_aws.py) to the queue the Lambda feeds")
+    if mode == "replay" and "<" in args.prefix:
+        raise SystemExit("give a prefix: python lld_aws.py replay live/<session_start>/")
 
     s3 = boto3.client("s3", region_name=REGION)
     model, device = lld.load_model(WEIGHTS_PATH)
@@ -190,14 +386,17 @@ def main():
 
     try:
         with tempfile.TemporaryDirectory(prefix="lld_") as work_dir:
-            run(s3, BUCKET, FRAMES_PREFIX, model, device, work_dir, live=live)
+            if mode == "live":
+                sqs = boto3.client("sqs", region_name=REGION)
+                run_live(s3, sqs, QUEUE_URL, model, device, work_dir, live=live)
+            else:
+                run_replay(s3, BUCKET, args.prefix, model, device, work_dir, live=live)
 
         if live and LIVE_HOLD:
             print("run finished, live view still up -- Ctrl+C to exit")
-            try:
-                threading.Event().wait()
-            except KeyboardInterrupt:
-                pass
+            threading.Event().wait()
+    except KeyboardInterrupt:
+        print("stopped")
     finally:
         if live:
             live.stop()
