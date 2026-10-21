@@ -40,6 +40,7 @@ from pathlib import Path, PurePosixPath
 import boto3
 import cv2 as cv
 import numpy as np
+import torch
 
 import lld
 from live_view import LiveView
@@ -47,7 +48,7 @@ from live_view import LiveView
 
 ## Config
 BUCKET = "initiative-vision-1"
-QUEUE_URL = os.environ.get("LLD_QUEUE_URL", "<your-queue-url>")  # SQS queue the Lambda feeds
+QUEUE_URL = os.environ.get("LLD_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/686584420503/lld-frames.fifo")  # SQS queue the Lambda feeds
 FRAMES_PREFIX = "live/<session_start>/"  # default for replay mode
 OUTPUT_PREFIX = "lld"
 WEIGHTS_PATH = lld.DEFAULT_WEIGHTS
@@ -61,6 +62,7 @@ FRAME_EXTENSIONS = (".jpg", ".jpeg", ".png")
 
 SESSION_IDLE_S = 30      # no frames for this long -> session finalized
 CHECKPOINT_EVERY = 50    # frames between metrics.json uploads during a session
+BACKLOG_EVERY = 10       # frames between queue-depth checks (shown on the live page)
 RECEIVE_BATCH = 5        # SQS messages per receive (max 10)
 VISIBILITY_S = 120       # a received batch must be processed within this, or SQS re-delivers it
 
@@ -270,11 +272,22 @@ def run_replay(s3, bucket, frames_prefix, model, device, work_dir, show=SHOW, li
     return out.doc()
 
 
+def queue_depth(sqs, queue_url):
+    """Frames waiting in the queue (approximate), or None if it can't be read."""
+    try:
+        attrs = sqs.get_queue_attributes(QueueUrl=queue_url, AttributeNames=["ApproximateNumberOfMessages"])
+        return int(attrs["Attributes"]["ApproximateNumberOfMessages"])
+    except Exception:
+        return None  # e.g. role lacks sqs:GetQueueAttributes -- not worth stopping for
+
+
 def run_live(s3, sqs, queue_url, model, device, work_dir, show=SHOW, live=None, max_receives=None):
     """Process frames from the SQS queue as they arrive, forever (or max_receives receive calls).
     Returns the last session's metrics doc."""
     current = None
     receives = 0
+    processed = 0
+    backlog = None
     stop = False
     print(f"waiting for frames on {queue_url}")
 
@@ -319,6 +332,7 @@ def run_live(s3, sqs, queue_url, model, device, work_dir, show=SHOW, live=None, 
                     sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=msg["ReceiptHandle"])
                     continue
 
+                t0 = time.perf_counter()
                 try:
                     frame = read_frame(s3, bucket, key)
                 except Exception as e:
@@ -332,16 +346,32 @@ def run_live(s3, sqs, queue_url, model, device, work_dir, show=SHOW, live=None, 
                     sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=msg["ReceiptHandle"])
                     continue
 
+                t1 = time.perf_counter()
                 metrics, overlay, warped = lld.process_frame(frame, model, device)
+                t2 = time.perf_counter()
                 lag = time.time() - body["frame_time"]  # capture on the Pi -> processed here
                 current.add(key, metrics, overlay, warped, frame_time=body["frame_time"],
                             frame_seq=body.get("frame_seq"), lag_s=round(lag, 3))
                 sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=msg["ReceiptHandle"])
+                t3 = time.perf_counter()
 
-                print(f"{session} #{len(current.frames) - 1} | lag {lag:.1f}s | {lld.format_metrics(metrics)}")
+                # where each frame's time goes: S3 download, model, the rest of process_frame, outputs + delete
+                infer = metrics.get("infer_s", 0.0)
+                timing = {"download_s": round(t1 - t0, 3), "infer_s": round(infer, 3),
+                          "post_s": round(t2 - t1 - infer, 3), "output_s": round(t3 - t2, 3),
+                          "total_s": round(t3 - t0, 3)}
+
+                processed += 1
+                if processed % BACKLOG_EVERY == 1:
+                    backlog = queue_depth(sqs, queue_url)
+
+                print(f"{session} #{len(current.frames) - 1} | lag {lag:.1f}s | backlog {backlog} | "
+                      f"dl {timing['download_s']:.2f} infer {timing['infer_s']:.2f} post {timing['post_s']:.2f} "
+                      f"out {timing['output_s']:.2f} = {timing['total_s']:.2f}s | {lld.format_metrics(metrics)}")
                 if live:
                     live.update(overlay, warped, metrics, session=session, index=len(current.frames) - 1,
-                                total=None, frame=PurePosixPath(key).name, lag_s=round(lag, 2))
+                                total=None, frame=PurePosixPath(key).name, lag_s=round(lag, 2),
+                                timing=timing, backlog=backlog)
                 if show and show_frame(overlay, warped):
                     stop = True
                     break
@@ -375,7 +405,7 @@ def main(argv=None):
 
     s3 = boto3.client("s3", region_name=REGION)
     model, device = lld.load_model(WEIGHTS_PATH)
-    print(f"model on {device}, display: {SHOW}")
+    print(f"model on {device}, torch threads {torch.get_num_threads()}, cpus {os.cpu_count()}, display: {SHOW}")
 
     live = None
     if LIVE_PORT:

@@ -1,3 +1,5 @@
+import time
+
 import torch
 import cv2 as cv
 import numpy as np
@@ -102,7 +104,11 @@ def process_frame(frame, model, device):
         img_tensor = img_tensor.unsqueeze(0)
 
     with torch.no_grad():
+        t_infer = time.perf_counter()
         detections, driveable_area, lld = model(img_tensor)
+        if img_tensor.is_cuda:
+            torch.cuda.synchronize()  # CUDA runs async; wait so the timing is real
+        infer_s = time.perf_counter() - t_infer
 
     # Extract binary masks for drivable area and lanes
     da_mask = driveable_area.argmax(dim=1)[0].cpu().numpy().astype(np.uint8) * 255
@@ -267,6 +273,7 @@ def process_frame(frame, model, device):
         "lane_valid": lane_valid,
         "departure": departure,  # None, "LEFT" or "RIGHT"
         "departure_text": departure_text,
+        "infer_s": round(infer_s, 3),  # model forward pass only
     }
 
     return metrics, overlay, warped
