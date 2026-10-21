@@ -121,8 +121,11 @@ class HandlerTest(unittest.TestCase):
         on_live_frame.handler(SAMPLE_EVENT, None)
         kw = self.sqs.send_message.call_args.kwargs
         body = json.loads(kw["MessageBody"])
+        uploaded_at, queued_at = body.pop("uploaded_at"), body.pop("queued_at")
         self.assertEqual(body, {"bucket": "initiative-vision-1", "key": "live/20261020T140512Z/20261020T140512.512Z.jpg",
                                 "session_start": "20261020T140512Z", "frame_time": 1792505112.512, "frame_seq": 7})
+        self.assertAlmostEqual(uploaded_at, 1792505113.1, places=3)  # the event's eventTime
+        self.assertGreater(queued_at, uploaded_at - 3600 * 24 * 365 * 10)  # a real epoch timestamp
         self.assertEqual(kw["MessageGroupId"], "20261020T140512Z")
 
     def test_ignores_its_own_archive_copies(self):

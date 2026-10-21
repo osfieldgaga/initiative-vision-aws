@@ -286,6 +286,20 @@ def queue_depth(sqs, queue_url):
         return None  # e.g. role lacks sqs:GetQueueAttributes -- not worth stopping for
 
 
+def lag_breakdown(body, received_at, started_at):
+    """Split a frame's lag into hops, from the timestamps the Pi and the Lambda put in the message.
+    pi_to_s3 uses the Pi's clock against AWS's, so a Pi clock error shows up there."""
+    uploaded_at, queued_at = body.get("uploaded_at"), body.get("queued_at")
+    if uploaded_at is None or queued_at is None:
+        return {}  # message from an older Lambda version
+    return {
+        "pi_to_s3_s": round(uploaded_at - body["frame_time"], 3),  # wait for upload + the upload itself
+        "s3_to_queue_s": round(queued_at - uploaded_at, 3),        # S3 event -> Lambda -> SQS
+        "queue_s": round(received_at - queued_at, 3),              # sitting in SQS
+        "batch_wait_s": round(started_at - received_at, 3),        # behind earlier frames of the same batch
+    }
+
+
 def newer_frame_waiting(sqs, queue_url, position, messages):
     """True if a newer frame than messages[position] is already available: a later message in
     this batch (FIFO, so later = newer), or anything still in the queue."""
@@ -311,6 +325,7 @@ def run_live(s3, sqs, queue_url, model, device, work_dir, show=SHOW, live=None, 
                                        WaitTimeSeconds=1 if show else 20,  # long poll: fewer empty (billed) receives
                                        VisibilityTimeout=VISIBILITY_S)
             messages = resp.get("Messages", [])
+            received_at = time.time()
 
             if not messages:
                 if current and time.time() - current.last_frame_at > SESSION_IDLE_S:
@@ -380,6 +395,7 @@ def run_live(s3, sqs, queue_url, model, device, work_dir, show=SHOW, live=None, 
                 timing = {"download_s": round(t1 - t0, 3), "infer_s": round(infer, 3),
                           "post_s": round(t2 - t1 - infer, 3), "output_s": round(t3 - t2, 3),
                           "total_s": round(t3 - t0, 3)}
+                timing.update(lag_breakdown(body, received_at, started_at=time.time() - (t3 - t0)))
 
                 processed += 1
                 if processed % BACKLOG_EVERY == 1:

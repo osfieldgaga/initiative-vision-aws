@@ -78,6 +78,11 @@ async function poll() {
         <tr><td>status</td><td class="${cls}">${x.departure_text}</td></tr>
         ${m.skipped ? `<tr><td>skipped</td><td class="bad">${m.skipped} frames (too old, replay to fill in)</td></tr>` : ""}
         ${m.backlog != null ? `<tr><td>backlog</td><td class="${m.backlog > 3 ? "bad" : "ok"}">${m.backlog} frames queued</td></tr>` : ""}
+        ${m.timing && m.timing.pi_to_s3_s != null ? `<tr><td>lag breakdown</td><td></td></tr>
+        <tr><td>&nbsp; Pi → S3</td><td>${fmt(m.timing.pi_to_s3_s)} s</td></tr>
+        <tr><td>&nbsp; S3 → queue</td><td>${fmt(m.timing.s3_to_queue_s)} s</td></tr>
+        <tr><td>&nbsp; in queue</td><td>${fmt(m.timing.queue_s + m.timing.batch_wait_s)} s</td></tr>
+        <tr><td>&nbsp; processing</td><td>${fmt(m.timing.total_s)} s</td></tr>` : ""}
         ${m.timing ? `<tr><td>per frame</td><td>${fmt(m.timing.total_s)} s</td></tr>
         <tr><td>&nbsp; download</td><td>${fmt(m.timing.download_s)} s</td></tr>
         <tr><td>&nbsp; inference</td><td>${fmt(m.timing.infer_s)} s</td></tr>

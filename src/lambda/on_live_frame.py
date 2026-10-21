@@ -4,7 +4,7 @@ The Pi (upload_live_frame.py) keeps overwriting one key, live/latest_frame.jpg, 
 x-amz-meta-session-start / frame-time / frame-seq metadata. Each overwrite fires this
 function, which:
   1. copies *that exact upload* to live/<session-start>/<frame-time>.jpg
-  2. sends {bucket, key, session_start, frame_time, frame_seq} to an SQS queue, which
+  2. sends {bucket, key, session_start, frame_time, frame_seq, uploaded_at, queued_at} to an SQS queue, which
      lld_aws.py (on EC2) consumes to process frames as they arrive
 
 Why the versionId matters: the Pi uploads ~2 frames/s, and by the time this function runs
@@ -134,7 +134,10 @@ def handler(event, context):
         print(f"archived s3://{bucket}/{key} (version {version_id}) -> {dest}")
 
         body = {"bucket": bucket, "key": dest, "session_start": session_start,
-                "frame_time": frame_time, "frame_seq": frame_seq}
+                "frame_time": frame_time, "frame_seq": frame_seq,
+                # for the lag breakdown on the server: S3 finished receiving the upload / queued now
+                "uploaded_at": event_time_to_epoch(rec["event_time"]),
+                "queued_at": datetime.now(timezone.utc).timestamp()}
         if queue_url:
             sqs.send_message(**queue_message(queue_url, body))
         results.append(body)

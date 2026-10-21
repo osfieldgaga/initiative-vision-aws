@@ -232,6 +232,16 @@ class LiveTest(Base):
         self.assertEqual(s3.puts.count("lld/S1/metrics.json"), 3)
 
 
+class LagBreakdownTest(unittest.TestCase):
+    def test_splits_lag_into_hops(self):
+        body = {"frame_time": 100.0, "uploaded_at": 101.5, "queued_at": 101.8}
+        got = lld_aws.lag_breakdown(body, received_at=102.0, started_at=102.25)
+        self.assertEqual(got, {"pi_to_s3_s": 1.5, "s3_to_queue_s": 0.3, "queue_s": 0.2, "batch_wait_s": 0.25})
+
+    def test_old_lambda_messages_have_no_breakdown(self):
+        self.assertEqual(lld_aws.lag_breakdown({"frame_time": 100.0}, 102.0, 102.0), {})
+
+
 class StaleFrameTest(Base):
     def run_live(self, s3, sqs, max_lag=10, receives=3):
         with mock.patch.object(lld_aws, "SESSION_IDLE_S", 0), mock.patch.object(lld_aws, "MAX_LAG_S", max_lag):
