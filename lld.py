@@ -12,6 +12,7 @@ imx219_matrix = np.array([[908.3685, 0, 647.8779],
 [0, 0, 1.0]], dtype=float)
 
 imx219_dist = np.array([-0.3404, 0.1337, 0, 0 ,0])
+CALIB_SIZE = (1280, 1280)  # (w, h) the matrix above was calibrated at; other sizes scale it
 
 ## Perpective warping params
 src = np.float32([
@@ -92,8 +93,13 @@ def load_model(weights_path=DEFAULT_WEIGHTS, device=None):
 _undistort_cache = {}
 
 def _undistort_params(w, h):
+    """(camera matrix scaled to a w x h frame, new camera matrix, valid roi). The intrinsics are in
+    CALIB_SIZE pixels; a frame of the same aspect at another size (e.g. 640x640 uploads) scales
+    fx, cx by w and fy, cy by h. The distortion coefficients don't depend on resolution."""
     if (w, h) not in _undistort_cache:
-        _undistort_cache[(w, h)] = cv.getOptimalNewCameraMatrix(imx219_matrix, imx219_dist, (w, h), 1, (w, h))
+        mtx = imx219_matrix * np.array([[w / CALIB_SIZE[0]], [h / CALIB_SIZE[1]], [1.0]])
+        new_mtx, roi = cv.getOptimalNewCameraMatrix(mtx, imx219_dist, (w, h), 1, (w, h))
+        _undistort_cache[(w, h)] = (mtx, new_mtx, roi)
     return _undistort_cache[(w, h)]
 
 
@@ -182,10 +188,10 @@ def undistort_frame(frame):
     """Raw camera frame -> undistorted, cropped to the valid area, rotated upright (full res)."""
     h, w = frame.shape[:2]
 
-    new_calib_mtx, roi = _undistort_params(w, h)
+    calib_mtx, new_calib_mtx, roi = _undistort_params(w, h)
 
     # undistort
-    undistorted_frame = cv.undistort(frame, imx219_matrix, imx219_dist, None, new_calib_mtx)
+    undistorted_frame = cv.undistort(frame, calib_mtx, imx219_dist, None, new_calib_mtx)
 
     # then crop
     x, y, w, h = roi

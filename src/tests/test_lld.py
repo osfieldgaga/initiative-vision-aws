@@ -1,9 +1,11 @@
-"""Tests for lld.decode_detections -- synthetic detection maps, no model needed."""
+"""Tests for lld: decode_detections on synthetic detection maps, and calibration scaling for
+smaller frames. No model needed."""
 
 import sys
 import unittest
 from pathlib import Path
 
+import cv2 as cv
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -49,6 +51,21 @@ class DecodeDetectionsTest(unittest.TestCase):
         self.assertEqual(len(objs), 2)
         self.assertGreater(objs[0]["box"][3], objs[1]["box"][3])
         self.assertEqual(objs[1]["box"][0], 5.5 * 32 - 71)  # the higher-scoring duplicate kept
+
+
+class UndistortScaleTest(unittest.TestCase):
+    def test_half_size_frame_undistorts_like_the_full_one(self):
+        # a checkerboard at the calibration size, and the same board at 640x640
+        yy, xx = np.mgrid[0:1280, 0:1280]
+        big = np.repeat((((xx // 80) + (yy // 80)) % 2 * 255).astype(np.uint8)[:, :, None], 3, axis=2)
+        small = cv.resize(big, (640, 640), interpolation=cv.INTER_AREA)
+
+        ub, us = lld.undistort_frame(big), lld.undistort_frame(small)
+        self.assertAlmostEqual(us.shape[0] / ub.shape[0], 0.5, delta=0.01)
+        self.assertAlmostEqual(us.shape[1] / ub.shape[1], 0.5, delta=0.01)
+        a = cv.resize(ub, (320, 320), interpolation=cv.INTER_AREA).astype(float)
+        b = cv.resize(us, (320, 320), interpolation=cv.INTER_AREA).astype(float)
+        self.assertLess(np.abs(a - b).mean(), 10)  # unscaled intrinsics give ~100: a different warp
 
 
 if __name__ == "__main__":
