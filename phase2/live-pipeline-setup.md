@@ -130,12 +130,19 @@ metrics.json for this session?" check can't tell the difference.
 The model runs on OpenCV's DNN module (`cv.dnn`) from an ONNX file, so the instance doesn't need
 torch. Make the ONNX once on a machine that has torch:
 ```
-python src/scripts/export_onnx.py                                   # -> data/weights/yolopv2_seg.onnx
+python src/scripts/export_onnx.py                                   # -> data/weights/yolopv2.onnx
 python src/scripts/compare_onnx.py <some frames dir>                # should report IoU 1.0000
 ```
-Copy over `lld.py`, `lld_aws.py`, `live_view.py` and `data/weights/yolopv2_seg.onnx`. On the instance,
+Sign reading (`signs.py`) needs OpenCV's CRNN text recognizer (33 MB):
+```
+mkdir -p data/weights/ocr
+curl -L -o data/weights/ocr/text_recognition_CRNN_EN_2021sep.onnx \
+  https://huggingface.co/opencv/text_recognition_crnn/resolve/main/text_recognition_CRNN_EN_2021sep.onnx
+```
+Copy over `lld.py`, `signs.py`, `lld_aws.py`, `live_view.py`, `data/weights/yolopv2.onnx` and
+`data/weights/ocr/`. `LLD_SIGNS=0` turns sign reading off. On the instance,
 check that COOL's OpenCV is 5.x and has the DNN module:
-`python -c "import cv2; print(cv2.__version__); cv2.dnn.readNetFromONNX('data/weights/yolopv2_seg.onnx')"`.
+`python -c "import cv2; print(cv2.__version__); cv2.dnn.readNetFromONNX('data/weights/yolopv2.onnx')"`.
 Then in COOL's venv (don't `pip install opencv-python` there -- it would shadow COOL's OpenCV):
 ```
 pip install boto3

@@ -46,7 +46,21 @@ DEGREE = 2                # polyfit degree, x = f(y)
 LOOKAHEAD_Y = 400         # BEV row where lane positions / offset are measured
 DEPARTURE_THRESHOLD = 0.4 # m; ~ (3.5 m lane - 1.8 m car) / 2 * 0.5
 
-DEFAULT_WEIGHTS = "data/weights/yolopv2_seg.onnx"  # cv.dnn; "data/weights/yolopv2.pt" = TorchScript
+## Object detection params (YOLOPv2's detection head, YOLOv7-style)
+# Trained on BDD100K with all traffic objects merged into one class: it finds vehicles only (every
+# box comes out as class 3 whatever the object), no people, signs or traffic lights.
+DET_CONF = 0.3            # objectness * class score, same defaults as the YOLOPv2 demo
+DET_IOU = 0.45            # NMS overlap threshold
+DET_LABEL = "vehicle"
+DET_STRIDES = (8, 16, 32)
+DET_ANCHORS = np.array([  # px at MODEL_SIZE, 3 anchors per stride (the model's anchor grids)
+    [[12, 16], [19, 36], [40, 28]],
+    [[36, 75], [76, 55], [72, 146]],
+    [[142, 110], [192, 243], [459, 401]],
+], dtype=np.float32)
+
+DEFAULT_WEIGHTS = "data/weights/yolopv2.onnx"  # cv.dnn; "data/weights/yolopv2.pt" = TorchScript
+DNN_OUTPUTS = ["da", "ll", "det8", "det16", "det32"]  # names set by src/scripts/export_onnx.py
 
 
 def load_model(weights_path=DEFAULT_WEIGHTS, device=None):
@@ -77,17 +91,19 @@ def _undistort_params(w, h):
 
 
 def _infer_dnn(net, bgr):
-    """OpenCV DNN forward pass. Returns (drivable mask, lane mask, seconds), masks 0/255 uint8."""
+    """OpenCV DNN forward pass. Returns (drivable mask, lane mask, detection maps, seconds):
+    masks 0/255 uint8, detection maps the three raw 1x255xHxW arrays for decode_detections."""
     # BGR -> RGB, HWC -> NCHW, 0..255 -> 0..1 in one call
     blob = cv.dnn.blobFromImage(bgr, scalefactor=1 / 255.0, swapRB=True)
     t_infer = time.perf_counter()
     net.setInput(blob)
-    da, ll = net.forward(["da", "ll"])
+    # OpenCV 5's engine wants every output requested at once
+    da, ll, *det_maps = net.forward(DNN_OUTPUTS)
     infer_s = time.perf_counter() - t_infer
 
     da_mask = da[0].argmax(axis=0).astype(np.uint8) * 255
     ll_mask = (ll[0, 0] > LANE_THRESHOLD).astype(np.uint8) * 255
-    return da_mask, ll_mask, infer_s
+    return da_mask, ll_mask, det_maps, infer_s
 
 
 def _infer_torch(model, device, bgr):
@@ -115,18 +131,48 @@ def _infer_torch(model, device, bgr):
     # Extract binary masks for drivable area and lanes
     da_mask = driveable_area.argmax(dim=1)[0].cpu().numpy().astype(np.uint8) * 255
     ll_mask = (lld[0, 0] > LANE_THRESHOLD).cpu().numpy().astype(np.uint8) * 255
-    return da_mask, ll_mask, infer_s
+    det_maps = [m.cpu().numpy() for m in detections[0]]
+    return da_mask, ll_mask, det_maps, infer_s
 
 
-def process_frame(frame, model, device):
-    """Run the full lane pipeline on one raw BGR camera frame.
+def decode_detections(det_maps, conf=DET_CONF, iou=DET_IOU):
+    """Raw YOLOPv2 detection maps -> list of {"label", "score", "box"}, after NMS.
 
-    Returns (metrics, overlay, warped):
-      metrics -- dict of plain Python types (JSON-serializable)
-      overlay -- 640x640 annotated camera view
-      warped  -- 800x800 annotated bird's-eye view
+    box is [x1, y1, x2, y2] in MODEL_SIZE pixels (the overlay image), sorted nearest first
+    (largest bottom y). Each map is 1 x (3 anchors * 85) x H x W: per anchor x, y, w, h,
+    objectness, then 80 class scores, all before the sigmoid.
     """
-    ## pre-process image
+    rows = []
+    for raw, anchors, stride in zip(det_maps, DET_ANCHORS, DET_STRIDES):
+        _, _, ny, nx = raw.shape
+        p = raw.reshape(3, 85, ny, nx).transpose(0, 2, 3, 1)  # anchor, y, x, channel
+        p = 1 / (1 + np.exp(-p))
+        gy, gx = np.mgrid[0:ny, 0:nx]
+        xy = (p[..., 0:2] * 2 - 0.5 + np.stack((gx, gy), axis=-1)) * stride  # box center
+        wh = (p[..., 2:4] * 2) ** 2 * anchors[:, None, None, :]
+        rows.append(np.concatenate([xy, wh, p[..., 4:]], axis=-1).reshape(-1, 85))
+    p = np.concatenate(rows)
+    p = p[p[:, 4] > conf]
+
+    scores = p[:, 4] * p[:, 5:].max(axis=1)
+    p, scores = p[scores > conf], scores[scores > conf]
+    boxes = np.column_stack([p[:, 0:2] - p[:, 2:4] / 2, p[:, 2:4]])  # x, y, w, h for NMSBoxes
+    keep = cv.dnn.NMSBoxes(boxes.tolist(), scores.tolist(), conf, iou)
+
+    objects = []
+    for i in np.array(keep, dtype=int).flatten():
+        x, y, w, h = boxes[i]
+        objects.append({
+            "label": DET_LABEL,
+            "score": round(float(scores[i]), 3),
+            "box": [round(float(v), 1) for v in (x, y, x + w, y + h)],
+        })
+    objects.sort(key=lambda o: -o["box"][3])
+    return objects
+
+
+def undistort_frame(frame):
+    """Raw camera frame -> undistorted, cropped to the valid area, rotated upright (full res)."""
     h, w = frame.shape[:2]
 
     new_calib_mtx, roi = _undistort_params(w, h)
@@ -141,11 +187,40 @@ def process_frame(frame, model, device):
     # only rotate after undistorting to preserve calibration
     undistorted_r90 = cv.rotate(undistorted_frame, cv.ROTATE_90_CLOCKWISE)
 
+    return undistorted_r90
+
+
+def process_frame(frame, model, device, sign_reader=None):
+    """Run the full lane pipeline on one raw BGR camera frame.
+
+    sign_reader: a signs.SignReader to also look for stop / speed-limit signs (None = skip).
+
+    Returns (metrics, overlay, warped):
+      metrics -- dict of plain Python types (JSON-serializable)
+      overlay -- 640x640 annotated camera view
+      warped  -- 800x800 annotated bird's-eye view
+    """
+    undistorted_r90 = undistort_frame(frame)
+
     undistorted_resized = cv.resize(undistorted_r90, (MODEL_SIZE, MODEL_SIZE), interpolation=cv.INTER_AREA)
     if isinstance(model, cv.dnn.Net):
-        da_mask, ll_mask, infer_s = _infer_dnn(model, undistorted_resized)
+        da_mask, ll_mask, det_maps, infer_s = _infer_dnn(model, undistorted_resized)
     else:
-        da_mask, ll_mask, infer_s = _infer_torch(model, device, undistorted_resized)
+        da_mask, ll_mask, det_maps, infer_s = _infer_torch(model, device, undistorted_resized)
+
+    objects = decode_detections(det_maps)
+
+    # signs are searched at full resolution (they're small), then boxes scaled to the overlay
+    found_signs, signs_s = [], 0.0
+    if sign_reader is not None:
+        t_signs = time.perf_counter()
+        found_signs = sign_reader.detect(undistorted_r90)
+        signs_s = time.perf_counter() - t_signs
+        sx = MODEL_SIZE / undistorted_r90.shape[1]
+        sy = MODEL_SIZE / undistorted_r90.shape[0]
+        for sign in found_signs:
+            x1, y1, x2, y2 = sign["box"]
+            sign["box"] = [round(x1 * sx, 1), round(y1 * sy, 1), round(x2 * sx, 1), round(y2 * sy, 1)]
 
     # Resize masks back to the frame size for overlay
     da_mask_resized = cv.resize(da_mask, (MODEL_SIZE, MODEL_SIZE), interpolation=cv.INTER_AREA)
@@ -289,6 +364,27 @@ def process_frame(frame, model, device):
         departure_text, departure_color = "In lane", (0, 255, 0)
     cv.putText(overlay, departure_text, (20, 140), cv.FONT_HERSHEY_SIMPLEX, 1, departure_color)
 
+    # detected objects: boxes on the camera view, count in the text block
+    for obj in objects:
+        x1, y1, x2, y2 = (int(v) for v in obj["box"])
+        cv.rectangle(overlay, (x1, y1), (x2, y2), (0, 255, 255), 2)
+        if x2 - x1 >= 40:  # distant boxes are too small for a readable label; the live page lists them all
+            cv.putText(overlay, f"{obj['label']} {obj['score']:.2f}", (x1, max(y1 - 4, 10)),
+                       cv.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv.LINE_AA)
+    cv.putText(overlay, f"Objects: {len(objects)}", (20, 170), cv.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255))
+
+    # signs: red box for STOP, white for speed limits, and what was read
+    sign_texts = []
+    for sign in found_signs:
+        text = "STOP" if sign["type"] == "stop" else f"LIMIT {sign['value']}"
+        color = (0, 0, 255) if sign["type"] == "stop" else (255, 255, 255)
+        x1, y1, x2, y2 = (int(v) for v in sign["box"])
+        cv.rectangle(overlay, (x1, y1), (x2, y2), color, 2)
+        cv.putText(overlay, text, (x1, max(y1 - 4, 10)), cv.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv.LINE_AA)
+        sign_texts.append(text)
+    if sign_texts:
+        cv.putText(overlay, "Signs: " + ", ".join(sign_texts), (20, 200), cv.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255))
+
     # closest point the camera can see right after the hood
     cv.line(warped, (0, 700), (800, 700), (255, 255, 0), 2)
 
@@ -316,7 +412,10 @@ def process_frame(frame, model, device):
         "lane_valid": lane_valid,
         "departure": departure,  # None, "LEFT" or "RIGHT"
         "departure_text": departure_text,
+        "objects": objects,  # [{"label", "score", "box": [x1, y1, x2, y2] in overlay px}], nearest first
+        "signs": found_signs,  # [{"type": "stop" | "speed_limit", "value", "score", "text", "box"}], see signs.py
         "infer_s": round(infer_s, 3),  # model forward pass only
+        "signs_s": round(signs_s, 3),  # sign search + OCR
     }
 
     return metrics, overlay, warped
@@ -344,7 +443,8 @@ def main():
     # bev = cv.VideoWriter('bev.mp4', fourcc, 2.0, (800, 800))  # size must match every frame you write, exactly
 
     # remote_path = Path("/home/osfield/osfield@creampie/Desktop/initiative-vision/latest_frame.jpg")
-    session_path = Path("/home/osfield/osfield@creampie/Desktop/initiative-vision/sessions/20261001T170034Z-d015/frames")
+    # session_path = Path("/home/osfield/osfield@creampie/Desktop/initiative-vision/sessions/20261001T170034Z-d015/frames")
+    session_path = Path("./test_sessions/20261001T170034Z-d015/frames")
 
     frame_names = sorted(item.name for item in session_path.iterdir() if item.is_file())
 

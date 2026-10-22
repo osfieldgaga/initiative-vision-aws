@@ -8,18 +8,59 @@ Rules: https://opencv26.devpost.com/rules
 
 Every entry must use **OpenCV 5 for substantive image/video analysis** and **run a meaningful component on AWS**.
 
-## How we're scored
+## Checklist by judging criterion (sweep, 2026-10-22)
 
-| Criterion | Weight | Where we stand (sweep, 2026-10-21) |
-|---|---|---|
-| Technical execution (OpenCV 5 depth, architecture, reliability, evaluation) | 30% | Pipeline works end to end. OpenCV does undistort, warp, contours and drawing, but **inference is PyTorch**, and there is **no evaluation yet** |
-| Innovation | 20% | Live Pi→cloud lane pipeline. The CAN differentiator from the brief isn't used on the cloud side yet |
-| Real-world impact | 20% | Needs a clear story in the report and video (lane departure / AV data) |
-| User experience | 10% | Live view only reachable through an SSH tunnel; mp4v videos won't play in a browser |
-| Documentation and presentation | 10% | Setup doc exists. No report, diagram, README or video |
-| Cloud delivery, reproducibility, responsible operation | 10% | Least-privilege IAM and a DLQ are in place. Infra is all console clicks, deps aren't pinned, no CloudWatch metrics |
+✅ done · 🟡 partial · ⬜ not started. **Bold** = essential (required by the rules, or a large share of that criterion's points).
 
-Special awards ($1k each, judged separately and optional): **Best Use of COOL** (needs verified COOL on Graviton plus a measured baseline) and **Agentic Vision** (vision output must change a later agent action). Nothing exists for the agentic one yet.
+### Technical execution, 30%: correctness and depth of the OpenCV 5 work
+- ✅ The whole perception stack runs on OpenCV 5: undistort, BEV homography warp, YOLOPv2 on `cv.dnn` (parity IoU 1.000 vs torch), `NMSBoxes` vehicle decoding, HSV/contour/shape sign candidates, CRNN OCR on `cv.dnn` with lexicon-constrained CTC
+- ✅ Tests: unit tests for decoding, CTC, the sign reader and metrics formatting
+- ⬜ **Verify on EC2 that COOL's `cv2` is 5.x with DNN and loads `yolopv2.onnx`.** If it isn't, the "OpenCV 5" requirement and the COOL story both break, so do this first
+- ⬜ **Lane evaluation**: hand-label 100–200 highway frames (lanes visible y/n, departure y/n), then report precision and recall for `lane_valid` and `departure`
+- 🟡 **Latency/throughput**: per-stage timings are logged; p50/p95 end-to-end lag on the c8g hasn't been reported yet
+- 🟡 Sign evaluation: real stop-sign results and synthetic speed-limit results exist only as scratch scripts. Make them reproducible (`eval_signs.py`) and test speed limits on real highway signs
+- ⬜ **Failure cases with images** (required): faded lines, glare, intersections, trucks, the "lane_valid with L off -3.99 m" anomaly
+- 🟡 Reliability: DLQ and lag-skip logic are in place; the behaviour during cellular gaps hasn't been documented yet
+
+### Innovation, 20%: originality and thoughtful use of CV/AI
+- ✅ A real car feeds a live cloud ADAS pipeline over cellular, from a Pi, rather than an offline demo
+- ✅ Sign OCR scored against the legal lexicon (CTC), which turns a weak generic OCR into a reader with 0 false positives. This is a good "thoughtful" point to explain
+- ⬜ Explain it clearly in the report and video. Innovation that isn't explained doesn't score
+- ⬜ (Optional) Forward collision distance via `perspectiveTransform` on box bottoms. This is cheap and adds a visible ADAS feature
+
+### Real-world impact, 20%: importance, usefulness, evidence of benefit
+- ⬜ **Problem/user story**: who uses it (fleet/driver monitoring, AV data collection, retrofit ADAS for older cars) and why cloud processing makes sense
+- ⬜ **Evidence**: highway drive results, cost per drive-hour, latency budget versus what a warning needs
+- ⬜ Honest framing: "not a safety system, no actuation"
+
+### User experience, 10%: usability, accessibility, interaction
+- 🟡 The live page shows the stream, metrics, objects, signs and timings, but it's only reachable through an SSH tunnel
+- ⬜ **Public judge URL** with auth, and a "replay a drive" button (virtual Pi) so judges can see it work without the car
+- ⬜ Finished sessions view with **H.264** videos (mp4v doesn't play in browsers)
+- ⬜ Quick accessibility pass: readable contrast, departure warning shown as text as well as colour
+
+### Documentation and presentation, 10%
+- 🟡 Setup doc (`live-pipeline-setup.md`) exists
+- ⬜ **README** (what it is, quickstart, links to the report, video and endpoint, plus where to download the weights)
+- ⬜ **Technical report** (problem, users, architecture, OpenCV 5, AWS, evaluation, limitations, responsible use)
+- ⬜ **Architecture diagram** (Pi → S3 → Lambda → SQS → EC2/COOL → endpoint; OpenCV stages marked)
+- ⬜ **Video of 5 minutes or less** (team, app working, architecture, results)
+- ⬜ Repo cleanup: untrack `.pyc`, move scratch scripts, decide what to do with `data/` and `outputs/`, remove the hardcoded account ID
+
+### Cloud delivery, reproducibility, responsible operation, 10%
+- ✅ Least-privilege IAM, DLQ, S3 versioning, a working event-driven pipeline on Graviton
+- ⬜ **Pinned dependencies** (`requirements.txt` for EC2 and for local/tests)
+- ⬜ IaC (one `aws` CLI script or a SAM template). Right now it's all console clicks
+- ⬜ CloudWatch: lag/inference custom metrics, one dashboard screenshot, a DLQ alarm
+- ⬜ Security: endpoint auth, and check the git history for credentials
+- ⬜ **Privacy**: blur plates and faces, or publish only overlays. State it in the report
+- ⬜ Plan for keeping the endpoint up from Oct 27 to Nov 9 (keep EC2 running, or serve static results from S3 and start EC2 only for demos)
+
+## Prizes: which to run for (decided 2026-10-22)
+
+- **Main prizes (1st–3rd):** automatically entered. Everything above feeds this.
+- **Best Use of COOL ($1k): go for it.** We're already 80% of the way there: the core workload runs on a COOL AMI on Graviton (c8g.xlarge), and since the cv.dnn port the core workload *is* OpenCV, so COOL actually runs it. What's missing is evidence: COOL version and instance config, `cv2.getBuildInformation()` showing COOL, and one reproducible benchmark (the pipeline's per-frame stages with COOL vs stock `opencv-python` on the same c8g, ideally plus an x86 c7i baseline, reported as latency, frames/s and $/drive-hour). That's about one day, and most of it doubles as main-track evaluation.
+- **Agentic Vision ($1k): skip.** Nothing exists yet. It needs an agent loop where vision output changes a later action, plus a workflow diagram, a trace, and evaluation of success, failure handling and human control. That's 1.5–2 days we don't have, and a rushed version risks being judged as "a chatbot explaining a fixed result". Revisit only if everything else is finished by Oct 25. The cheapest qualifying idea: a controller that reacts to low `lane_valid` or a sign sighting by requesting full-rate uploads for the next N seconds, and flags segments for human review.
 
 ---
 
@@ -28,7 +69,7 @@ Special awards ($1k each, judged separately and optional): **Best Use of COOL** 
 - [ ] **Technical report** covering problem, users, architecture, OpenCV 5 implementation, AWS deployment, evaluation, limitations, and responsible use
 - [ ] **Judge-accessible repo** (`github.com/osfieldgaga/initiative-vision-aws`). Make it public or add judges.
   - [ ] README with what it is, a quickstart, and links to the report, video and endpoint
-  - [ ] `yolopv2.pt` is gitignored, so document where to download it (or host it in S3)
+  - [ ] `yolopv2.pt` and `yolopv2.onnx` are gitignored, so document where to download it (or host it in S3)
   - [ ] Cleanup: add `__pycache__/` to `.gitignore` and untrack the `.pyc` files; decide on the 200 MB of `data/` and `outputs/`; move scratch scripts (`draw.py`, `read.py`, `rescale.py`, `yolop_test.py`, ...) somewhere out of the way
   - [ ] Remove the hardcoded account id from the `QUEUE_URL` default in `lld_aws.py`
 - [ ] **Pinned dependencies**: `requirements.txt` for EC2 (boto3, torch, numpy, plus the COOL AMI version) and for local/tests. Add `boto3` to `.venv`, which fixes the one failing test.
@@ -93,23 +134,43 @@ After the drive:
 ## 7. OpenCV 5 and COOL (requirement + optional award)
 
 - [ ] **Verify OpenCV 5 on the EC2 instance**: run `python -c "import cv2; print(cv2.__version__)"` in the COOL venv. Local `.venv` is 5.0.0. If COOL ships 4.x we have a requirement problem, so check this first.
-- [x] **YOLOPv2 on `cv.dnn`** (2026-10-21): `src/scripts/export_onnx.py` exports the two seg heads to ONNX (99 MB, detection head pruned) and `lld.load_model` picks cv.dnn for `.onnx`, which is now the default. Torch is no longer needed at inference. `src/scripts/compare_onnx.py` on 40 real frames: lane/drivable mask IoU 1.0000, lane_valid/departure 40/40, offset diff 0.0000 m; median inference 0.35 s cv.dnn vs 0.50 s torch (x86 laptop CPU).
+- [x] **YOLOPv2 on `cv.dnn`** (2026-10-21): `src/scripts/export_onnx.py` exports `data/weights/yolopv2.onnx` (seg heads + raw detection maps; the anchor grids are hardcoded in `lld.DET_ANCHORS`), and `lld.load_model` picks cv.dnn for `.onnx`, which is now the default. Torch is no longer needed at inference. `src/scripts/compare_onnx.py` on 40 real frames: lane/drivable mask IoU 1.0000, detections 40/40 same count with box IoU 1.0000, lane_valid/departure 40/40, offset diff 0.0000 m; median inference 0.42 s cv.dnn vs 0.50 s torch (x86 laptop CPU).
   - [ ] On EC2: confirm COOL's cv2 is 5.x with the DNN module and loads the ONNX, then measure per-frame time on the c8g vs the old ~0.89 s torch number
   - [ ] Optional: try `net.setPreferableBackend/Target` options and an FP16 export for more speed
 - [ ] **Best Use of COOL** (optional): record COOL version + instance config, prove COOL executes the workload (`cv2.getBuildInformation()`), and benchmark the *pipeline's* OpenCV stages (undistort, resize, warp, cvtColor) on Graviton+COOL vs stock OpenCV (same box, and ideally an x86 instance). `time_cool_vs_stock.py` covers resize/adaptiveThreshold only, and no numbers have been recorded yet.
+
+## 7b. Object detection and ADAS stretch goals
+
+- [x] **Vehicle boxes from YOLOPv2** (2026-10-21): `lld.decode_detections` decodes the YOLOv7-style head with `cv.dnn.NMSBoxes`. Boxes are drawn on the overlay, `metrics["objects"]` holds `[{label, score, box}]` nearest first, and the live page lists them.
+  - **Limitation:** YOLOPv2's detector only finds **vehicles**. It was trained on BDD100K with every traffic object merged into one class, so every box comes out as class 3. On 81 frames it found no people, traffic lights or signs, even where they were clearly visible. Put this in the report.
+- [ ] **Second detector for people / traffic lights** (optional now that signs are handled by `signs.py`): a small COCO model (e.g. YOLOv8n/YOLO11n ONNX on cv.dnn) covers `person`, `bicycle` and `traffic light`. Cost: a second forward pass per frame, so measure it on the c8g first.
+- [x] **Stop-sign + speed-limit reader** (`signs.py`, 2026-10-22), all OpenCV:
+  1. color: HSV red mask for STOP; Canny edges for the white speed sign (a white sign on a bright sky has no color edge)
+  2. shape: octagon-ish red blob / upright ~4:5 quadrilateral with a bright face and dark legend
+  3. OCR: OpenCV's CRNN (`cv.dnn.TextRecognitionModel` weights, run through `cv.dnn`) on the text band, scored with **lexicon-constrained CTC**: log P("stop") or log P(each of 15..85 step 5) versus the free-form best reading. That's why a 60 px blurry "stoe" still counts as STOP, and a random blob reading "t" doesn't.
+  - On the real stop-sign approach (`20260927T184255Z-fddd` frames 4000-4120): STOP in 20/83 frames, and basically every frame once the sign is >= ~60 px wide.
+  - **False positives: 0** across 6,154 frames (every 15th frame of all local sessions), including 107 red look-alikes (lens flares, billboards, brake lights, trees tinted pink by the camera).
+  - Speed limits: **no speed-limit sign exists in the local footage**, so this was validated synthetically. The public-domain MUTCD R2-1 sign (Wikimedia) with each value re-drawn was pasted into real frames with blur, purple cast and JPEG q70; 2,000 signs over 5 seeds. Read correctly: 100% at >= 85 px wide, ~70% at 50-70 px (misses are all at the candidate stage), **0 misreads**. Signs under 48 px are skipped on purpose: at 40 px "55" was read as "65".
+  - Cost: `detect()` median 16 ms, p95 ~60 ms per frame on this laptop
+  - [ ] **Validate speed limits on the highway drive**, the first real data with R2-1 signs. At ~1 upload/s a sign may only be in 1–2 frames at readable size.
+  - [ ] Not handled: the yellow advisory speed signs, "MINIMUM", night (retroreflective glare), signs seen at an angle. The CRNN font isn't Highway Gothic.
+  - [ ] Optional: promote the scratch evaluation (real sweep + synthetic) to `src/scripts/eval_signs.py` so the numbers are reproducible for the report
+  - [ ] Stretch: persist the last speed limit across frames (it stays in force until the next sign) and show it on the live page
+
+- [ ] **Forward collision warning** (stretch): the bottom-center of each vehicle box is on the road, so `cv.perspectiveTransform` with the BEV homography `lld.M` gives its distance ahead (y=700 is 4.874 m from the car) and its lateral position (in-lane or not). Then warn on distance or on its change between frames (time-to-collision). Caveats: the ground-plane assumption breaks on hills, and the homography was calibrated only out to ~7 m, so far estimates are rough. Car speed isn't uploaded live, so TTC would come from vision only.
 
 ## 8. Scope decisions to make now (5 days left)
 
 The Phase 2 brief (scenario mining, MCP agent, pseudo-label panels, MATLAB) is far beyond what fits in 5 days. Suggested cut, to be confirmed:
 
 - **Keep / finish:** live lane pipeline, virtual Pi, public endpoint, highway drive, evaluation incl. a CAN cross-check, report, video
-- **Now (in progress):** cv.dnn port (helps the 30% criterion and COOL), COOL benchmark
+- **Done:** cv.dnn port, vehicle boxes, sign reader. **Next:** COOL verification + benchmark (Best Use of COOL)
 - **Cut:** MCP agent / Agentic Vision award, depth/semantic panels, MATLAB. Say so in the report's "limitations / future work".
 
-## Suggested order
+## Suggested order (revised 2026-10-22; the highway drive hasn't happened yet)
 
-1. Day 1 (Oct 21–22): fix missing-lane metrics, verify OpenCV 5 on EC2, prep and do the highway drive
-2. Day 2: replay the drive, pin deps, README, repo cleanup, H.264 outputs
-3. Day 3: virtual Pi + public endpoint, IaC script, CloudWatch metrics
-4. Day 4: evaluation numbers + failure cases, architecture diagram, report draft
-5. Day 5 (Oct 25–26): record and edit the video, final read-through, submit with margin (not at 11:40 pm)
+1. **Thu Oct 22:** on EC2, verify COOL `cv2` 5.x + DNN, deploy the ONNX, OCR weights and `signs.py`, and measure per-frame time. Then prep for and **do the highway drive**, since everything downstream needs that footage.
+2. **Fri Oct 23:** COOL vs stock benchmark on the c8g (optionally x86); pinned requirements, README, repo cleanup, H.264 outputs.
+3. **Sat Oct 24:** virtual Pi + public endpoint with auth, IaC script, CloudWatch metrics.
+4. **Sun Oct 25:** evaluation (hand labels, latency, signs, failure cases), architecture diagram, report draft.
+5. **Mon Oct 26:** video, privacy pass, final read-through, submit by early evening PT. Don't leave it until 11:40 pm.

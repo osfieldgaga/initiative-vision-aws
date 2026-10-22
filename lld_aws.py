@@ -42,6 +42,7 @@ import cv2 as cv
 import numpy as np
 
 import lld
+import signs
 from live_view import LiveView
 
 
@@ -51,6 +52,7 @@ QUEUE_URL = os.environ.get("LLD_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com
 FRAMES_PREFIX = "live/<session_start>/"  # default for replay mode
 OUTPUT_PREFIX = "lld"
 WEIGHTS_PATH = os.environ.get("LLD_WEIGHTS", lld.DEFAULT_WEIGHTS)  # .onnx -> cv.dnn, .pt -> TorchScript
+READ_SIGNS = os.environ.get("LLD_SIGNS", "1") != "0"  # stop / speed-limit signs (signs.py); LLD_SIGNS=0 = off
 REGION = "us-east-1"
 
 FPS = 2.0
@@ -240,7 +242,7 @@ def show_frame(overlay, warped):
 
 ## Modes
 
-def run_replay(s3, bucket, frames_prefix, model, device, work_dir, show=SHOW, live=None):
+def run_replay(s3, bucket, frames_prefix, model, device, work_dir, show=SHOW, live=None, sign_reader=None):
     """Process every frame under frames_prefix in order. Returns the uploaded metrics doc."""
     keys = list_frame_keys(s3, bucket, frames_prefix)
     if not keys:
@@ -256,7 +258,7 @@ def run_replay(s3, bucket, frames_prefix, model, device, work_dir, show=SHOW, li
                 print(f"Frame {index}: could not decode {key}, skipping")
                 continue
 
-            metrics, overlay, warped = lld.process_frame(frame, model, device)
+            metrics, overlay, warped = lld.process_frame(frame, model, device, sign_reader)
             out.add(key, metrics, overlay, warped)
             print(f"Frame {index}/{len(keys)} | {lld.format_metrics(metrics)}")
 
@@ -307,7 +309,7 @@ def newer_frame_waiting(sqs, queue_url, position, messages):
     return bool(queue_depth(sqs, queue_url))
 
 
-def run_live(s3, sqs, queue_url, model, device, work_dir, show=SHOW, live=None, max_receives=None):
+def run_live(s3, sqs, queue_url, model, device, work_dir, show=SHOW, live=None, max_receives=None, sign_reader=None):
     """Process frames from the SQS queue as they arrive, forever (or max_receives receive calls).
     Returns the last session's metrics doc."""
     current = None
@@ -381,7 +383,7 @@ def run_live(s3, sqs, queue_url, model, device, work_dir, show=SHOW, live=None, 
                     continue
 
                 t1 = time.perf_counter()
-                metrics, overlay, warped = lld.process_frame(frame, model, device)
+                metrics, overlay, warped = lld.process_frame(frame, model, device, sign_reader)
                 t2 = time.perf_counter()
                 lag = time.time() - body["frame_time"]  # capture on the Pi -> processed here
                 current.add(key, metrics, overlay, warped, frame_time=body["frame_time"],
@@ -389,10 +391,12 @@ def run_live(s3, sqs, queue_url, model, device, work_dir, show=SHOW, live=None, 
                 sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=msg["ReceiptHandle"])
                 t3 = time.perf_counter()
 
-                # where each frame's time goes: S3 download, model, the rest of process_frame, outputs + delete
+                # where each frame's time goes: S3 download, model, sign reading, the rest of process_frame,
+                # outputs + delete
                 infer = metrics.get("infer_s", 0.0)
-                timing = {"download_s": round(t1 - t0, 3), "infer_s": round(infer, 3),
-                          "post_s": round(t2 - t1 - infer, 3), "output_s": round(t3 - t2, 3),
+                signs_s = metrics.get("signs_s", 0.0)
+                timing = {"download_s": round(t1 - t0, 3), "infer_s": round(infer, 3), "signs_s": round(signs_s, 3),
+                          "post_s": round(t2 - t1 - infer - signs_s, 3), "output_s": round(t3 - t2, 3),
                           "total_s": round(t3 - t0, 3)}
                 timing.update(lag_breakdown(body, received_at, started_at=time.time() - (t3 - t0)))
 
@@ -401,7 +405,8 @@ def run_live(s3, sqs, queue_url, model, device, work_dir, show=SHOW, live=None, 
                     backlog = queue_depth(sqs, queue_url)
 
                 print(f"{session} #{len(current.frames) - 1} | lag {lag:.1f}s | backlog {backlog} | "
-                      f"dl {timing['download_s']:.2f} infer {timing['infer_s']:.2f} post {timing['post_s']:.2f} "
+                      f"dl {timing['download_s']:.2f} infer {timing['infer_s']:.2f} signs {timing['signs_s']:.2f} "
+                      f"post {timing['post_s']:.2f} "
                       f"out {timing['output_s']:.2f} = {timing['total_s']:.2f}s | {lld.format_metrics(metrics)}")
                 if live:
                     live.update(overlay, warped, metrics, session=session, index=len(current.frames) - 1,
@@ -440,6 +445,7 @@ def main(argv=None):
 
     s3 = boto3.client("s3", region_name=REGION)
     model, device = lld.load_model(WEIGHTS_PATH)
+    sign_reader = signs.SignReader() if READ_SIGNS else None
     if isinstance(model, cv.dnn.Net):
         threads = f"OpenCV {cv.__version__}, cv threads {cv.getNumThreads()}"
     else:
@@ -458,9 +464,9 @@ def main(argv=None):
         with tempfile.TemporaryDirectory(prefix="lld_") as work_dir:
             if mode == "live":
                 sqs = boto3.client("sqs", region_name=REGION)
-                run_live(s3, sqs, QUEUE_URL, model, device, work_dir, live=live)
+                run_live(s3, sqs, QUEUE_URL, model, device, work_dir, live=live, sign_reader=sign_reader)
             else:
-                run_replay(s3, BUCKET, args.prefix, model, device, work_dir, live=live)
+                run_replay(s3, BUCKET, args.prefix, model, device, work_dir, live=live, sign_reader=sign_reader)
 
         if live and LIVE_HOLD:
             print("run finished, live view still up -- Ctrl+C to exit")

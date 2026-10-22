@@ -38,6 +38,10 @@ PAGE = """<!doctype html>
     <table id="m"></table>
     <p>offset (m), last 200 frames</p>
     <canvas id="plot" width="400" height="160"></canvas>
+    <p>signs</p>
+    <table id="signs"></table>
+    <p>objects, nearest first</p>
+    <table id="objs"></table>
   </div>
 </div>
 <script>
@@ -88,9 +92,22 @@ async function poll() {
         ${m.timing ? `<tr><td>per frame</td><td>${fmt(m.timing.total_s)} s</td></tr>
         <tr><td>&nbsp; download</td><td>${fmt(m.timing.download_s)} s</td></tr>
         <tr><td>&nbsp; inference</td><td>${fmt(m.timing.infer_s)} s</td></tr>
+        ${m.timing.signs_s != null ? `<tr><td>&nbsp; signs</td><td>${fmt(m.timing.signs_s)} s</td></tr>` : ""}
         <tr><td>&nbsp; post-proc</td><td>${fmt(m.timing.post_s)} s</td></tr>
         <tr><td>&nbsp; outputs</td><td>${fmt(m.timing.output_s)} s</td></tr>` : ""}
         <tr><td>run</td><td>${m.done ? "finished" : "running"}</td></tr>`;
+      const signs = x.signs || [];
+      document.getElementById("signs").innerHTML = signs.length
+        ? signs.map(s => `<tr><td class="${s.type === "stop" ? "bad" : "ok"}">` +
+                         `${s.type === "stop" ? "STOP" : "SPEED LIMIT " + s.value}</td>` +
+                         `<td class="na">score ${fmt(s.score)}, read "${s.text}"</td></tr>`).join("")
+        : `<tr><td class="na">none</td></tr>`;
+      const objs = x.objects || [];
+      document.getElementById("objs").innerHTML = objs.length
+        ? `<tr class="na"><td>#</td><td>label</td><td>score</td><td>box (x1,y1,x2,y2)</td></tr>` +
+          objs.map((o, i) => `<tr><td>${i + 1}</td><td>${o.label}</td><td>${fmt(o.score)}</td>` +
+                            `<td class="na">${o.box.map(v => Math.round(v)).join(", ")}</td></tr>`).join("")
+        : `<tr><td class="na">none</td></tr>`;
       if (m.session !== lastSession) { history.length = 0; lastSession = m.session; }
       if (isNewFrame) {
         history.push({offset: x.offset_m, valid: x.lane_valid, departure: x.departure});

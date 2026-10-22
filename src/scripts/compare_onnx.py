@@ -6,6 +6,7 @@
 
 For n frames spread evenly over the folder, runs both backends and reports:
   - lane-line and drivable-area mask IoU (cv.dnn vs torch)
+  - detections: how often the box count matches and the worst box IoU between matched boxes
   - how often the final metrics agree (lane_valid, departure) and the largest offset difference
   - inference time per backend
 
@@ -32,12 +33,20 @@ def iou(a, b):
     return 1.0 if union == 0 else float(np.logical_and(a, b).sum() / union)
 
 
+def box_iou(a, b):
+    ix = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+    iy = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+    inter = ix * iy
+    union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+    return inter / union if union > 0 else 0.0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("frames_dir")
     parser.add_argument("--n", type=int, default=50)
     parser.add_argument("--torch-weights", default="data/weights/yolopv2.pt")
-    parser.add_argument("--onnx-weights", default="data/weights/yolopv2_seg.onnx")
+    parser.add_argument("--onnx-weights", default="data/weights/yolopv2.onnx")
     parser.add_argument("--min-iou", type=float, default=0.95)
     args = parser.parse_args(argv)
 
@@ -49,16 +58,22 @@ def main(argv=None):
     frames = frames[::max(1, len(frames) // args.n)][:args.n]
 
     ll_ious, da_ious, t_times, d_times, offset_diffs = [], [], [], [], []
-    valid_agree = departure_agree = 0
+    valid_agree = departure_agree = det_count_agree = 0
+    box_ious = []
     for path in frames:
         frame = cv.imread(str(path))
         if frame is None:
             continue
         model_in = cv.resize(frame, (lld.MODEL_SIZE, lld.MODEL_SIZE), interpolation=cv.INTER_AREA)
-        t_da, t_ll, _ = lld._infer_torch(t_model, t_device, model_in)
-        d_da, d_ll, _ = lld._infer_dnn(d_model, model_in)
+        t_da, t_ll, t_det, _ = lld._infer_torch(t_model, t_device, model_in)
+        d_da, d_ll, d_det, _ = lld._infer_dnn(d_model, model_in)
         ll_ious.append(iou(t_ll, d_ll))
         da_ious.append(iou(t_da, d_da))
+
+        t_objs, d_objs = lld.decode_detections(t_det), lld.decode_detections(d_det)
+        det_count_agree += len(t_objs) == len(d_objs)
+        for t_obj in t_objs:  # best-matching cv.dnn box for each torch box
+            box_ious.append(max((box_iou(t_obj["box"], d["box"]) for d in d_objs), default=0.0))
 
         t_metrics, _, _ = lld.process_frame(frame, t_model, t_device)
         d_metrics, _, _ = lld.process_frame(frame, d_model, d_device)
@@ -73,6 +88,9 @@ def main(argv=None):
     print(f"{n} frames from {args.frames_dir}  (OpenCV {cv.__version__}, torch {torch.__version__})")
     print(f"lane mask IoU       mean {statistics.mean(ll_ious):.4f}  min {min(ll_ious):.4f}")
     print(f"drivable mask IoU   mean {statistics.mean(da_ious):.4f}  min {min(da_ious):.4f}")
+    print(f"detection count     agrees {det_count_agree}/{n}, {len(box_ious)} torch boxes")
+    if box_ious:
+        print(f"detection box IoU   mean {statistics.mean(box_ious):.4f}  min {min(box_ious):.4f}")
     print(f"lane_valid agrees   {valid_agree}/{n}")
     print(f"departure agrees    {departure_agree}/{n}")
     if offset_diffs:

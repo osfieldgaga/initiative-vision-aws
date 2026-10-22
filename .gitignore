@@ -1,3 +1,5 @@
 .venv/
 /data/weights/yolopv2.pt
-/data/weights/yolopv2_seg.onnx
+/data/weights/yolopv2.onnx
+/data/weights/ocr/
+/test_sessions

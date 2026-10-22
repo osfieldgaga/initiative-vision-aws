@@ -88,7 +88,7 @@ def jpeg():
     return cv.imencode(".jpg", np.zeros((64, 64, 3), np.uint8))[1].tobytes()
 
 
-def fake_process_frame(frame, model, device):
+def fake_process_frame(frame, model, device, sign_reader=None):
     metrics = {"offset_m": 0.1, "left_off_m": -1.7, "right_off_m": 1.9, "road_width_m": 3.6,
                "left_present": True, "right_present": True, "left_coeff": None, "right_coeff": None,
                "lane_valid": True, "departure": None, "departure_text": "In lane"}
