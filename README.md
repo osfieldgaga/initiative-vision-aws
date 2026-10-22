@@ -83,6 +83,17 @@ LLD_QUEUE_URL=https://sqs.us-east-1.amazonaws.com/<account-id>/lld-frames.fifo \
 
 `--no-upload` only plays it locally.
 
+To share a recorded session, make a privacy-safe copy first. Faces and plate areas are blurred, the GPS
+columns are removed from `decoded.csv`, and raw `can.csv` (which holds the VIN) is left out:
+
+```bash
+curl -L -o data/weights/privacy/face_detection_yunet_2023mar.onnx --create-dirs \
+  https://huggingface.co/opencv/face_detection_yunet/resolve/main/face_detection_yunet_2023mar.onnx
+.venv/bin/python src/scripts/privacy_package.py <session_dir> <out_dir> [--start 60 --end 600]
+```
+
+Check the before/after samples it writes to `<out_dir>/<session>-review/` before publishing.
+
 ### 3. EC2: the live service
 
 On a COOL AMI instance (we use c8g.4xlarge for drives), inside COOL's venv. Don't install
