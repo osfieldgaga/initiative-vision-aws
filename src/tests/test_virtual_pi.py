@@ -49,5 +49,47 @@ class VirtualPiTest(unittest.TestCase):
         self.assertLessEqual(body["uploaded_at"], body["queued_at"])
 
 
+class CanTrackTest(unittest.TestCase):
+    CSV = ("timestamp_ns,seq,message,VehicleSpeed,EngineRPM,SteeringWheelAngle,AcceleratorPedal2,BrakePedalPos,PRNDL2,TurnSignals\n"
+           "1000000000,1,a,,800,,,,P,0\n"
+           "2000000000,2,b,10.5,820,-12.5,127,104,D,2\n")
+
+    def test_lookup_by_drive_time_with_scaling(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "decoded.csv").write_text(self.CSV)
+            can = virtual_pi.CanTrack(Path(d) / "decoded.csv", t0_ns=1_000_000_000)
+        self.assertTrue(can.available)
+        self.assertTrue(all(v is None for v in can.at(-0.5).values()))  # before the first row
+        first = can.at(0.5)
+        self.assertEqual((first["rpm"], first["gear"], first["speed_mph"]), (800.0, "P", None))
+        second = can.at(5.0)
+        self.assertEqual((second["speed_mph"], second["steering_deg"], second["gear"], second["blinker"]),
+                         (10.5, -12.5, "D", 2.0))
+        self.assertAlmostEqual(second["accel_pct"], 50.0)   # 127 / 254
+        self.assertAlmostEqual(second["brake_pct"], 50.0)   # 104 / 0xd0
+
+    def test_missing_file_and_empty_values_still_draw(self):
+        can = virtual_pi.CanTrack("/nonexistent/decoded.csv", 0)
+        self.assertFalse(can.available)
+        for values, available in ((can.at(1.0), True), ({}, False)):
+            panel = virtual_pi.draw_can_panel(636, values, available)
+            self.assertEqual(panel.shape, (636, virtual_pi.PANEL_W, 3))
+        self.assertEqual(virtual_pi.draw_timeline(940, 30.0, 120.0).shape, (virtual_pi.TIMELINE_H, 940, 3))
+
+    def test_blinker_flashes_on_its_side_only(self):
+        green = (60, 220, 60)
+        def lit(blinker, t, x):  # is the arrow around column x drawn green?
+            p = virtual_pi.draw_can_panel(636, {"blinker": blinker, "speed_mph": None, "rpm": None,
+                                                "steering_deg": None, "accel_pct": None, "brake_pct": None,
+                                                "gear": None}, True, t)
+            return bool((p[10:35, x - 12:x + 12] == green).all(axis=2).any())
+        half_period = 1 / (2 * virtual_pi.BLINK_HZ)
+        self.assertTrue(lit(1.0, 0.0, 212))                    # left on
+        self.assertFalse(lit(1.0, 0.0, 272))                   # right stays dark
+        self.assertFalse(lit(1.0, half_period * 1.01, 212))    # ...and it flashes
+        self.assertTrue(lit(2.0, 0.0, 272))
+        self.assertFalse(lit(0.0, 0.0, 212) or lit(0.0, 0.0, 272))
+
+
 if __name__ == "__main__":
     unittest.main()
