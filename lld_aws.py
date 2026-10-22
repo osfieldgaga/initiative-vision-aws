@@ -35,12 +35,18 @@ CloudWatch: per-frame lag, its hops, inference and processing time go to the Ini
 namespace every METRICS_FLUSH_S (put_metric_data with value lists, so p50/p95 work). Needs
 cloudwatch:PutMetricData on the instance role; LLD_METRICS=0 turns it off.
 
+Public demo: LIVE_TOKEN_SECRET turns on the live page's signed-token check (see live_view.py),
+and LLD_IDLE_STOP_MIN=N shuts the instance down (= stopped on EC2, so not billed) after N minutes
+with no frame processed and no page request. SIGTERM (systemctl stop, shutdown) finalizes the
+current session before exiting, like Ctrl+C.
+
 Credentials: on EC2 attach an instance role; boto3 picks it up automatically.
 """
 import argparse
 import json
 import os
 import shutil
+import signal
 import subprocess
 import tempfile
 import threading
@@ -69,6 +75,8 @@ FPS = 2.0
 SHOW = bool(os.environ.get("DISPLAY"))
 LIVE_PORT = int(os.environ.get("LIVE_PORT", 8080))  # 0 = no live view
 LIVE_HOLD = bool(os.environ.get("LIVE_HOLD"))
+LIVE_TOKEN_SECRET = os.environ.get("LIVE_TOKEN_SECRET") or None
+IDLE_STOP_MIN = float(os.environ.get("LLD_IDLE_STOP_MIN", 0))  # 0 = never
 FRAME_EXTENSIONS = (".jpg", ".jpeg", ".png")
 
 SESSION_IDLE_S = 30      # no frames for this long -> session finalized
@@ -343,6 +351,46 @@ class MetricsPublisher:
         self.flush()
 
 
+## Idle auto-stop
+
+class IdleStop:
+    """Shuts the machine down after idle_s without activity: a processed frame (touch()) or a
+    live-page request (live.last_request). On EC2 a shutdown stops the instance."""
+
+    def __init__(self, idle_s, live=None, shutdown=("sudo", "-n", "shutdown", "-h", "now"), check_s=30):
+        self.idle_s, self.live, self.shutdown, self.check_s = idle_s, live, list(shutdown), check_s
+        self.last = time.time()
+        self.stop = threading.Event()
+        self.fired = False
+
+    def touch(self):
+        self.last = time.time()
+
+    def idle_for(self, now=None):
+        last = max(self.last, self.live.last_request if self.live else 0.0)
+        return (now or time.time()) - last
+
+    def check(self, now=None):
+        """Shut down if idle for too long; True if it did."""
+        if self.fired or self.idle_for(now) < self.idle_s:
+            return False
+        self.fired = True
+        print(f"idle for {self.idle_for(now) / 60:.0f} min: shutting down")
+        subprocess.run(self.shutdown, check=False)
+        return True
+
+    def start(self):
+        def run():
+            while not self.stop.wait(self.check_s):
+                self.check()
+        threading.Thread(target=run, daemon=True).start()
+        return self
+
+
+def _sigterm(signum, frame):
+    raise KeyboardInterrupt  # same clean exit as Ctrl+C: the current session is finalized
+
+
 ## Display helpers
 
 def show_frame(overlay, warped):
@@ -427,7 +475,7 @@ def newer_frame_waiting(sqs, queue_url, position, messages):
 
 
 def run_live(s3, sqs, queue_url, model, device, work_dir, show=SHOW, live=None, max_receives=None, sign_reader=None,
-             cw_metrics=None):
+             cw_metrics=None, idle=None):
     """Process frames from the SQS queue as they arrive, forever (or max_receives receive calls).
     Returns the last session's metrics doc."""
     current = None
@@ -521,6 +569,8 @@ def run_live(s3, sqs, queue_url, model, device, work_dir, show=SHOW, live=None, 
                 timing.update(lag_breakdown(body, received_at, started_at=time.time() - (t3 - t0)))
 
                 processed += 1
+                if idle:
+                    idle.touch()
                 if processed % BACKLOG_EVERY == 1:
                     backlog = queue_depth(sqs, queue_url)
                 if cw_metrics:
@@ -558,6 +608,7 @@ def main(argv=None):
                         help="e.g. live/20261020T140512Z/ or sessions/<id>/frames/")
     args = parser.parse_args(argv)
     mode = args.mode or "live"
+    signal.signal(signal.SIGTERM, _sigterm)  # systemctl stop / shutdown: finalize like Ctrl+C
 
     if OUTPUT_PREFIX.rstrip("/") in ("sessions", "live"):
         raise SystemExit("OUTPUT_PREFIX must be separate from sessions/ and live/")
@@ -580,7 +631,10 @@ def main(argv=None):
     live = None
     if LIVE_PORT:
         try:
-            live = LiveView(port=LIVE_PORT, departure_threshold=lld.DEPARTURE_THRESHOLD).start()
+            live = LiveView(port=LIVE_PORT, departure_threshold=lld.DEPARTURE_THRESHOLD,
+                            token_secret=LIVE_TOKEN_SECRET).start()
+            if LIVE_TOKEN_SECRET:
+                print("live view: signed-token access check on")
         except OSError as e:
             print(f"live view disabled, could not bind port {LIVE_PORT}: {e}")
 
@@ -592,9 +646,13 @@ def main(argv=None):
                 if PUBLISH_METRICS:
                     cw_metrics = MetricsPublisher(boto3.client("cloudwatch", region_name=REGION)).start()
                     print(f"CloudWatch metrics: namespace {METRICS_NAMESPACE}, every {METRICS_FLUSH_S}s")
+                idle = None
+                if IDLE_STOP_MIN:
+                    idle = IdleStop(IDLE_STOP_MIN * 60, live).start()
+                    print(f"idle auto-stop: shutting down after {IDLE_STOP_MIN:g} min without frames or viewers")
                 try:
                     run_live(s3, sqs, QUEUE_URL, model, device, work_dir, live=live, sign_reader=sign_reader,
-                             cw_metrics=cw_metrics)
+                             cw_metrics=cw_metrics, idle=idle)
                 finally:
                     if cw_metrics:
                         cw_metrics.close()

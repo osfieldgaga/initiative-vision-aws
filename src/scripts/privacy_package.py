@@ -3,10 +3,12 @@
 
     python src/scripts/privacy_package.py <session_dir> <out_dir> [--start 60] [--end 600]
     python src/scripts/privacy_package.py test_sessions/20261022T164127Z-084b judge_data
+    python src/scripts/privacy_package.py ... --size 640     # ~5x smaller download, what the Pi uploads anyway
 
 Writes <out_dir>/<session>/ with what virtual_pi.py needs, and nothing else:
 
-    frames/       every frame in the window, faces and plate areas blurred (JPEG q90, like the recorder)
+    frames/       every frame in the window, faces and plate areas blurred (JPEG q90 like the recorder,
+                  or --size 640: blurred at full resolution first, then saved at 640 x 640, q85)
     frames.csv    the ledger, trimmed to the window
     decoded.csv   decoded CAN, trimmed, with the GPS columns removed
     session.json  copied as is (camera and system settings, no host or user names)
@@ -155,6 +157,9 @@ def main(argv=None):
     parser.add_argument("out_dir")
     parser.add_argument("--start", type=float, default=0.0, help="seconds after the first frame")
     parser.add_argument("--end", type=float, default=None, help="seconds after the first frame (default: the end)")
+    parser.add_argument("--size", type=int, default=0,
+                        help="save frames at SIZE x SIZE (detection still runs at full resolution); 0 = as recorded")
+    parser.add_argument("--quality", type=int, default=None, help=f"JPEG quality (default {JPEG_QUALITY}, 85 with --size)")
     args = parser.parse_args(argv)
 
     src = Path(args.session_dir)
@@ -180,6 +185,7 @@ def main(argv=None):
     if (src / "session.json").exists():
         shutil.copy2(src / "session.json", out / "session.json")
 
+    quality = args.quality or (85 if args.size else JPEG_QUALITY)
     anonymizer = Anonymizer()
     counts = {"face": 0, "plate": 0}
     frames_blurred = reviewed = skipped = 0
@@ -194,7 +200,8 @@ def main(argv=None):
             print(f"unreadable, left out: {row['filename']}")
             continue
         clean, regions = anonymizer.anonymize(raw)
-        cv.imwrite(str(dst), clean, [cv.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+        saved = cv.resize(clean, (args.size, args.size), interpolation=cv.INTER_AREA) if args.size else clean
+        cv.imwrite(str(dst), saved, [cv.IMWRITE_JPEG_QUALITY, quality])
         for kind, *_ in regions:
             counts[kind] += 1
         if regions:
@@ -214,12 +221,12 @@ Made by `src/scripts/privacy_package.py` on {time.strftime('%Y-%m-%d')} from ses
 
 - **Removed:** raw `can.csv` (contains the vehicle's VIN and the OnStar GPS position) and `system.csv`.
 - **decoded.csv:** columns removed: {', '.join(dropped) or 'none'}; {can_rows} rows kept.
-- **Frames:** {len(rows)} frames, {(t_to - t_from) / 1e9:.0f} s of driving.
+- **Frames:** {len(rows)} frames, {(t_to - t_from) / 1e9:.0f} s of driving, saved {f"at {args.size} x {args.size}" if args.size else "at recorded size"}, JPEG q{quality} (blurring was done at full resolution).
   - Faces (YuNet, OpenCV model zoo, score >= {FACE_SCORE}): {counts['face']} regions blurred (includes false positives such as wheels; blurring them is harmless).
   - Number plates: the lower half of every vehicle box at least {MIN_VEHICLE_W} px wide (YOLOPv2): {counts['plate']} regions blurred.
   - {frames_blurred} frames had at least one region blurred in this run.
 - Blurring is irreversible (pixelated, then smoothed) and was applied before the JPEG was written.
-- Automatic detection can miss things; the frames were spot-checked before publishing.
+- Automatic detection can miss things; check the before/after samples in the review folder before publishing.
 """)
     print(f"done: faces {counts['face']}, plate areas {counts['plate']}, {frames_blurred} frames blurred, "
           f"{skipped} already done; review samples in {review}")

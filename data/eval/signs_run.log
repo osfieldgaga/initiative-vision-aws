@@ -1,0 +1,10 @@
+stop: STOP in 26/83 frames of the approach; widths {'min': 27, 'median': 35.0, 'max': 39}
+false alarms: 4 in 8001 frames
+speed limits, 1964 synthetic signs:
+     30-40 px: 0/333 correct, 0 misread, 333 missed
+     40-50 px: 111/341 correct, 0 misread, 230 missed
+     50-70 px: 194/343 correct, 0 misread, 149 missed
+     70-85 px: 287/310 correct, 1 misread, 22 missed
+    85-100 px: 328/331 correct, 1 misread, 2 missed
+   100-140 px: 304/306 correct, 1 misread, 1 missed
+315 s; written to /media/osfield/Data/Initiative Labs/AWS/data/eval/signs_results.json

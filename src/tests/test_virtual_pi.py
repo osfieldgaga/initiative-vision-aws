@@ -1,7 +1,9 @@
 """Tests for src/scripts/virtual_pi.py: frame pacing and the metadata the Lambda reads."""
 
+import json
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -89,6 +91,39 @@ class CanTrackTest(unittest.TestCase):
         self.assertFalse(lit(1.0, half_period * 1.01, 212))    # ...and it flashes
         self.assertTrue(lit(2.0, 0.0, 272))
         self.assertFalse(lit(0.0, 0.0, 212) or lit(0.0, 0.0, 272))
+
+
+
+class DemoCredentialsTest(unittest.TestCase):
+    INFO = {"accessKeyId": "AK", "secretAccessKey": "SK", "sessionToken": "ST", "region": "us-east-1",
+            "bucket": "b", "queueUrl": "https://q/x.fifo", "expiration": "2030-01-01T00:00:00Z"}
+
+    def fake_urlopen(self, payload=None, error=None):
+        import io
+        import urllib.error
+        from unittest import mock
+        def urlopen(req, timeout=None):
+            self.sent = json.loads(req.data)
+            if error:
+                raise urllib.error.HTTPError(req.full_url, error, "x", {}, io.BytesIO(b""))
+            return mock.MagicMock(__enter__=lambda s: io.BytesIO(json.dumps(payload).encode()))
+        return mock.patch.object(virtual_pi.urllib.request, "urlopen", urlopen)
+
+    def test_fetches_and_renews_before_expiry(self):
+        with self.fake_urlopen(self.INFO):
+            demo = virtual_pi.DemoCredentials("https://site", "pw")
+        self.assertEqual(self.sent, {"password": "pw"})
+        self.assertEqual(demo.info["queueUrl"], "https://q/x.fifo")
+        self.assertFalse(demo.due())
+        demo.expires = time.time() + 60          # about to expire
+        self.assertTrue(demo.due())
+        s3, sqs = demo.clients()
+        self.assertEqual(s3._request_signer._credentials.access_key, "AK")
+
+    def test_wrong_password_is_a_clear_error(self):
+        with self.fake_urlopen(error=401), self.assertRaises(SystemExit) as err:
+            virtual_pi.DemoCredentials("https://site", "nope")
+        self.assertIn("wrong demo password", str(err.exception))
 
 
 if __name__ == "__main__":

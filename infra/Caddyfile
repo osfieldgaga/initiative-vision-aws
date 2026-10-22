@@ -1,0 +1,17 @@
+# Caddy on the EC2 instance: HTTPS for the public demo, in front of live_view.py (127.0.0.1:8080).
+# Caddy gets and renews the Let's Encrypt certificate itself; it needs ports 80 and 443 open in
+# the security group and demo.initiativelabs.cc pointing at the instance's Elastic IP.
+#   sudo apt install -y caddy && sudo cp infra/Caddyfile /etc/caddy/Caddyfile && sudo systemctl reload caddy
+# Access control is in live_view.py (signed token, LIVE_TOKEN_SECRET), not here.
+
+demo.initiativelabs.cc {
+	reverse_proxy 127.0.0.1:8080 {
+		flush_interval -1    # pass MJPEG frames through as they come, no buffering
+	}
+	header {
+		# only the website may show it in a frame
+		Content-Security-Policy "frame-ancestors https://initiativelabs.cc https://www.initiativelabs.cc"
+		Strict-Transport-Security "max-age=31536000"
+		-Server
+	}
+}

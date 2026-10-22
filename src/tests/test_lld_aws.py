@@ -385,3 +385,65 @@ class MetricsPublisherTest(unittest.TestCase):
         pub.add("LagSeconds", 1.0)
         pub.flush()
         self.assertTrue(pub.warned)
+
+
+class LiveTokenTest(unittest.TestCase):
+    def test_token_round_trip_expiry_and_tampering(self):
+        from live_view import make_token, token_valid
+        tok = make_token("s3cret", hours=1, now=1000)
+        self.assertTrue(token_valid("s3cret", tok, now=1000 + 3599))
+        self.assertFalse(token_valid("s3cret", tok, now=1000 + 3601))      # expired
+        self.assertFalse(token_valid("other", tok, now=1000))               # wrong secret
+        expiry, sig = tok.split(".")
+        self.assertFalse(token_valid("s3cret", f"{int(expiry) + 99999}.{sig}", now=1000))  # extended expiry
+        for bad in (None, "", "garbage", "123.", ".abc"):
+            self.assertFalse(token_valid("s3cret", bad, now=1000))
+
+    def test_server_requires_a_token_then_uses_the_cookie(self):
+        import urllib.error
+        import urllib.request
+        from live_view import LiveView, make_token
+        view = LiveView(port=0, token_secret="s3cret")
+        view.start()
+        try:
+            base = f"http://127.0.0.1:{view._server.server_address[1]}"
+            with self.assertRaises(urllib.error.HTTPError) as err:
+                urllib.request.urlopen(base + "/metrics")
+            self.assertEqual(err.exception.code, 401)
+
+            class NoRedirect(urllib.request.HTTPRedirectHandler):
+                def redirect_request(self, *a, **kw):
+                    return None
+            opener = urllib.request.build_opener(NoRedirect)
+            with self.assertRaises(urllib.error.HTTPError) as err:  # 303 to drop the token from the URL
+                opener.open(base + "/?token=" + make_token("s3cret"))
+            self.assertEqual(err.exception.code, 303)
+            cookie = err.exception.headers["Set-Cookie"].split(";")[0]
+            self.assertIn("HttpOnly", err.exception.headers["Set-Cookie"])
+            req = urllib.request.Request(base + "/metrics", headers={"Cookie": cookie})
+            self.assertEqual(urllib.request.urlopen(req).status, 200)
+            self.assertGreater(view.last_request, 0)
+        finally:
+            view.stop()
+
+    def test_no_secret_means_no_check(self):
+        import urllib.request
+        from live_view import LiveView
+        view = LiveView(port=0).start()
+        try:
+            self.assertEqual(urllib.request.urlopen(f"http://127.0.0.1:{view._server.server_address[1]}/metrics").status, 200)
+        finally:
+            view.stop()
+
+
+class IdleStopTest(unittest.TestCase):
+    def test_shuts_down_once_after_idle_from_frames_and_viewers(self):
+        live = types.SimpleNamespace(last_request=0.0)
+        with mock.patch.object(lld_aws.subprocess, "run") as run:
+            idle = lld_aws.IdleStop(600, live, shutdown=["true"])
+            idle.last = 1000.0
+            live.last_request = 1300.0                  # a viewer kept it alive
+            self.assertFalse(idle.check(now=1800))      # 500 s since the viewer
+            self.assertTrue(idle.check(now=1950))       # 650 s: shut down
+            self.assertFalse(idle.check(now=3000))      # only once
+            run.assert_called_once_with(["true"], check=False)

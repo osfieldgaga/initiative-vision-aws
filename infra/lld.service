@@ -1,0 +1,22 @@
+# systemd unit for the live service, started on boot (so starting the instance starts the demo).
+#   sudo cp infra/lld.service /etc/systemd/system/ && sudo systemctl daemon-reload
+#   sudo systemctl enable --now lld          logs: journalctl -u lld -f
+# Settings come from /etc/lld.env (see infra/lld.env.example; keep it chmod 600, it holds the secret).
+
+[Unit]
+Description=Initiative Vision live lane pipeline (lld_aws.py live)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/initiative-vision-aws
+EnvironmentFile=/etc/lld.env
+ExecStart=/opt/cool/venvs/python_3.12/bin/python lld_aws.py live
+Restart=on-failure
+RestartSec=5
+# SIGTERM makes lld_aws finalize the current session (videos + metrics to S3) before exiting
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target

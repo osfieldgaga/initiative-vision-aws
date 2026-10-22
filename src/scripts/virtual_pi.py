@@ -25,6 +25,12 @@ to its archive key live/<session-start>/<frame time>.jpg and the SQS message the
 have sent is sent from here, in the same format, so lld_aws.py needs no change. Needs the queue
 URL (--queue-url or LLD_QUEUE_URL) and s3:PutObject on live/* + sqs:SendMessage on the queue.
 
+--demo (for judges): no AWS account needed. Asks for the demo password (or IVISION_DEMO_PASSWORD),
+gets one-hour upload credentials from https://initiativelabs.cc/api/ivision/credentials (limited
+to putting frames under live/ and sending to the frame queue, like the real Pi; renewed before
+they expire), which also starts the cloud side; then uploads in direct mode at 640 x 640. Watch
+the results at https://initiativelabs.cc/ivision-demo.
+
 Next to the frame, a CAN panel shows what the car was doing at that moment: speed, RPM,
 steering wheel angle, accelerator and brake pedal, and gear (PRNDL). It's read from the session's
 decoded.csv (same monotonic clock as the frames). Make it once with the Pi repo's decoder:
@@ -44,6 +50,10 @@ from __future__ import annotations
 import argparse
 import bisect
 import csv
+import getpass
+import json
+import urllib.error
+import urllib.request
 import math
 import threading
 import time
@@ -68,6 +78,8 @@ POLL_S = 0.1                 # same as the Pi uploader
 MIN_UPLOAD_INTERVAL_S = 1.0  # at most 1 upload/s, same as the Pi
 JPEG_QUALITY = 70
 DISPLAY_SIZE = 640
+DEMO_SITE = "https://initiativelabs.cc"
+RENEW_BEFORE_S = 600       # renew --demo credentials this long before they expire
 SEEK_S = 10
 PANEL_W = 300
 TIMELINE_H = 34
@@ -170,15 +182,59 @@ def upload_metadata(session_start, frame_time, frame_seq):
     return {"session-start": session_start, "frame-time": f"{frame_time:.3f}", "frame-seq": str(frame_seq)}
 
 
+def fetch_demo_credentials(site, password):
+    """POST the demo password to the website; returns its JSON (temporary AWS credentials,
+    region, bucket, queueUrl). Raises SystemExit with a readable message on failure."""
+    req = urllib.request.Request(f"{site}/api/ivision/credentials", method="POST",
+                                 data=json.dumps({"password": password}).encode(),
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as res:
+            return json.loads(res.read())
+    except urllib.error.HTTPError as e:
+        raise SystemExit("wrong demo password" if e.code == 401 else f"demo site error {e.code}: {e.read()[:200]!r}")
+    except urllib.error.URLError as e:
+        raise SystemExit(f"can't reach {site}: {e.reason}")
+
+
+class DemoCredentials:
+    """Temporary credentials from the demo site, renewed RENEW_BEFORE_S before they expire."""
+
+    def __init__(self, site, password):
+        self.site, self.password = site, password
+        self.info, self.expires = None, 0.0
+        self.renew()
+
+    def renew(self):
+        self.info = fetch_demo_credentials(self.site, self.password)
+        exp = self.info.get("expiration")
+        self.expires = (datetime.fromisoformat(exp.replace("Z", "+00:00")).timestamp() if exp
+                        else time.time() + 3600)
+
+    def due(self):
+        return time.time() > self.expires - RENEW_BEFORE_S
+
+    def clients(self):
+        import boto3
+        session = boto3.Session(aws_access_key_id=self.info["accessKeyId"],
+                                aws_secret_access_key=self.info["secretAccessKey"],
+                                aws_session_token=self.info["sessionToken"],
+                                region_name=self.info.get("region", "us-east-1"))
+        return session.client("s3"), session.client("sqs")
+
+
 class Uploader(threading.Thread):
     """Uploads the latest published frame at most once per MIN_UPLOAD_INTERVAL_S."""
 
-    def __init__(self, session_start, bucket, enabled, queue_url=None):
+    def __init__(self, session_start, bucket, enabled, queue_url=None, demo=None):
         super().__init__(daemon=True)
         self.session_start, self.bucket, self.enabled = session_start, bucket, enabled
         self.queue_url = queue_url  # set = direct mode
+        self.demo = demo            # DemoCredentials: temporary keys from the demo site
         self.s3 = self.sqs = None
-        if enabled:
+        if enabled and demo:
+            self.s3, self.sqs = demo.clients()
+        elif enabled:
             import boto3
             self.s3 = boto3.client("s3")
             if queue_url:
@@ -210,6 +266,9 @@ class Uploader(threading.Thread):
                 continue
             t = time.time()
             try:
+                if self.demo and self.demo.due():
+                    self.demo.renew()
+                    self.s3, self.sqs = self.demo.clients()
                 self.status = self._send(jpg.tobytes(), seq, frame_time, t)
                 print(f"{self.status}  age when done {time.time() - frame_time:.2f}s")
             except Exception as e:  # keep going through network drops, like the Pi
@@ -367,12 +426,22 @@ def main(argv=None):
     parser.add_argument("--direct", action="store_true",
                         help="PUT to the archive key and send the SQS message from here (no S3 event / Lambda)")
     parser.add_argument("--queue-url", default=os.environ.get("LLD_QUEUE_URL"), help="for --direct")
+    parser.add_argument("--demo", nargs="?", const=DEMO_SITE, default=None, metavar="SITE",
+                        help=f"judges: upload with temporary credentials from the demo site (default {DEMO_SITE})")
     parser.add_argument("--size", type=int, default=None,
                         help="upload frames resized to SIZE x SIZE (default: as recorded, 1280)")
     parser.add_argument("--duration", type=float, default=None, help="stop after this many seconds")
     parser.add_argument("--headless", action="store_true", help="no window (for testing)")
     args = parser.parse_args(argv)
 
+    demo = None
+    if args.demo and not args.no_upload:
+        password = os.environ.get("IVISION_DEMO_PASSWORD") or getpass.getpass("Demo password: ")
+        demo = DemoCredentials(args.demo.rstrip("/"), password)
+        args.direct, args.queue_url, args.bucket = True, demo.info["queueUrl"], demo.info["bucket"]
+        args.size = args.size or 640
+        print(f"demo: credentials until {demo.info.get('expiration')} (renewed automatically); the cloud side "
+              f"is starting -- watch it at {args.demo.rstrip('/')}/ivision-demo")
     if args.direct and not args.no_upload and not args.queue_url:
         parser.error("--direct needs --queue-url or LLD_QUEUE_URL")
     frames = load_frames(args.session_dir)
@@ -387,7 +456,7 @@ def main(argv=None):
     run_start = time.time()
     session_start = session_start_name(run_start)
     uploader = Uploader(session_start, args.bucket, enabled=not args.no_upload,
-                        queue_url=args.queue_url if args.direct else None)
+                        queue_url=args.queue_url if args.direct else None, demo=demo)
     uploader.start()
     mode = ("dry run" if args.no_upload else
             f"direct: s3://{args.bucket}/live/{session_start}/ + {args.queue_url}" if args.direct else

@@ -11,9 +11,22 @@ Endpoints:
     /overlay.mjpg camera overlay (MJPEG stream)
     /bev.mjpg     bird's-eye view (MJPEG stream)
     /metrics      latest metrics as JSON
+
+Public demo (LIVE_TOKEN_SECRET set): behind Caddy on demo.initiativelabs.cc, every request needs a
+token signed with that secret -- "<expiry unix time>.<hex HMAC-SHA256(secret, expiry)>". The
+website mints one after its password check and opens /?token=...; the page then keeps it in an
+httpOnly cookie, so the streams and /metrics are covered too. Without the secret (the default)
+nothing is checked: localhost and the SSH tunnel work as before. For testing:
+
+    LIVE_TOKEN_SECRET=... python live_view.py token [hours]      # prints a token
 """
+import hashlib
+import hmac
 import json
+import os
+import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import cv2 as cv
@@ -125,12 +138,37 @@ poll();
 """
 
 
+TOKEN_COOKIE = "lv_token"
+DENIED_PAGE = (b"<!doctype html><meta charset=utf-8><title>Initiative Vision</title>"
+               b"<body style='background:#111;color:#ddd;font-family:sans-serif;margin:40px'>"
+               b"<h2>Initiative Vision live demo</h2><p>Open it from "
+               b"<a style='color:#6af' href='https://initiativelabs.cc/ivision-demo'>initiativelabs.cc/ivision-demo</a>.</p>")
+
+
+def make_token(secret, hours=2.0, now=None):
+    expiry = int((now or time.time()) + hours * 3600)
+    return f"{expiry}.{hmac.new(secret.encode(), str(expiry).encode(), hashlib.sha256).hexdigest()}"
+
+
+def token_valid(secret, token, now=None):
+    """True if token was signed with secret and hasn't expired."""
+    try:
+        expiry, sig = token.split(".", 1)
+        expected = hmac.new(secret.encode(), expiry.encode(), hashlib.sha256).hexdigest()
+        return hmac.compare_digest(sig, expected) and int(expiry) > (now or time.time())
+    except (AttributeError, ValueError):
+        return False
+
+
 class LiveView:
     """Holds the latest frames/metrics and serves them to any connected browser."""
 
-    def __init__(self, host="127.0.0.1", port=8080, jpeg_quality=80, departure_threshold=0.4):
+    def __init__(self, host="127.0.0.1", port=8080, jpeg_quality=80, departure_threshold=0.4,
+                 token_secret=None):
         self.host = host
         self.port = port
+        self.token_secret = token_secret  # None = no access check (localhost / SSH tunnel)
+        self.last_request = 0.0           # time.time() of the last request, for the idle auto-stop
         self.jpeg_quality = jpeg_quality
         self.page = PAGE.replace("__DEP__", str(departure_threshold)).encode()
 
@@ -146,8 +184,34 @@ class LiveView:
         view = self
 
         class Handler(BaseHTTPRequestHandler):
+            def _token(self):
+                """(token from ?token= or the cookie, came_from_query)."""
+                query = self.path.split("?", 1)[1] if "?" in self.path else ""
+                for part in query.split("&"):
+                    if part.startswith("token="):
+                        return part[len("token="):], True
+                for part in self.headers.get("Cookie", "").split(";"):
+                    name, _, value = part.strip().partition("=")
+                    if name == TOKEN_COOKIE:
+                        return value, False
+                return None, False
+
             def do_GET(self):
                 path = self.path.split("?")[0]
+                view.last_request = time.time()
+                if view.token_secret:
+                    token, from_query = self._token()
+                    if not token_valid(view.token_secret, token):
+                        self._send(401, "text/html; charset=utf-8", DENIED_PAGE)
+                        return
+                    if from_query:  # keep it in a cookie and drop it from the address bar
+                        self.send_response(303)
+                        self.send_header("Location", path)
+                        self.send_header("Set-Cookie", f"{TOKEN_COOKIE}={token}; Path=/; HttpOnly; Secure; "
+                                                       f"SameSite=Lax; Max-Age={int(token.split('.')[0]) - int(time.time())}")
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+                        return
                 if path == "/":
                     self._send(200, "text/html; charset=utf-8", view.page)
                 elif path == "/metrics":
@@ -227,3 +291,10 @@ class LiveView:
         if self._server:
             self._server.shutdown()
             self._server.server_close()
+
+
+if __name__ == "__main__" and sys.argv[1:2] == ["token"]:
+    secret = os.environ.get("LIVE_TOKEN_SECRET")
+    if not secret:
+        raise SystemExit("set LIVE_TOKEN_SECRET")
+    print(make_token(secret, float(sys.argv[2]) if len(sys.argv) > 2 else 2.0))

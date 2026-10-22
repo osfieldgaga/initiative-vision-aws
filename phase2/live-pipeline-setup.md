@@ -257,3 +257,28 @@ network drops. Start it alongside `start.py`; each start is a new session.
 | SQS FIFO (send + receive + delete) | ~$0.01 |
 | Archived frames (~1 GB) | ~$0.023 per month kept |
 | EC2 instance | while it's running -- the dominant cost; stop it when not driving |
+
+## 7. Public demo (demo.initiativelabs.cc)
+
+Judges open `initiativelabs.cc/ivision-demo` (password), which starts this instance and shows the
+live view from `https://demo.initiativelabs.cc`. On the AWS side:
+
+1. **Elastic IP** (EC2 → Elastic IPs → Allocate → Associate with the instance), so the address
+   survives stop/start. **DNS:** an `A` record `demo` → that IP, wherever initiativelabs.cc's DNS is
+   managed (Vercel → Domains, if it's there).
+2. **Security group:** inbound TCP 80 and 443 from anywhere (Caddy needs 80 for the certificate).
+   Port 8080 stays closed: `live_view.py` only listens on 127.0.0.1.
+3. **Caddy:** `sudo apt install -y caddy`, then `sudo cp infra/Caddyfile /etc/caddy/Caddyfile &&
+   sudo systemctl reload caddy`. It gets the HTTPS certificate on its own.
+4. **Service on boot:** `sudo install -m 600 infra/lld.env.example /etc/lld.env` and fill it in
+   (queue URL, `LIVE_TOKEN_SECRET` from `openssl rand -hex 32`, `LLD_IDLE_STOP_MIN=20`), then
+   `sudo cp infra/lld.service /etc/systemd/system/ && sudo systemctl daemon-reload &&
+   sudo systemctl enable --now lld`. Starting the instance now starts the demo.
+5. **Stop, not terminate, on shutdown:** EC2 → instance → Actions → Instance settings → Change
+   shutdown behavior → Stop (the default for EBS-backed instances). The idle auto-stop relies on it.
+6. **Test without the website:** `LIVE_TOKEN_SECRET=<same secret> python live_view.py token` prints
+   a token; open `https://demo.initiativelabs.cc/?token=<it>`. Without a token the page says to go
+   through initiativelabs.cc.
+
+The website side (password, start button, status, temporary upload credentials for judges'
+virtual Pi) lives in the website repo and is set up separately.
