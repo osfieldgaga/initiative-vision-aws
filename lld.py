@@ -61,6 +61,11 @@ DET_ANCHORS = np.array([  # px at MODEL_SIZE, 3 anchors per stride (the model's 
 
 DEFAULT_WEIGHTS = "data/weights/yolopv2.onnx"  # cv.dnn; "data/weights/yolopv2.pt" = TorchScript
 DNN_OUTPUTS = ["da", "ll", "det8", "det16", "det32"]  # names set by src/scripts/export_onnx.py
+# Classic engine + FP16 target: 0.74 s/frame on a c8g.xlarge (COOL, Graviton4) vs 1.20 s for the
+# new engine and 0.97 s classic FP32. FP16 only takes effect on ARMv8; elsewhere OpenCV warns and
+# falls back to FP32 (on x86 the new engine is faster: 0.41 vs 0.74 s on the dev laptop).
+DNN_ENGINE = cv.dnn.ENGINE_CLASSIC
+DNN_TARGET = cv.dnn.DNN_TARGET_CPU_FP16
 
 
 def load_model(weights_path=DEFAULT_WEIGHTS, device=None):
@@ -71,7 +76,9 @@ def load_model(weights_path=DEFAULT_WEIGHTS, device=None):
     so the ONNX path runs without it.
     """
     if str(weights_path).endswith(".onnx"):
-        return cv.dnn.readNetFromONNX(str(weights_path)), "opencv-cpu"
+        net = cv.dnn.readNetFromONNX(str(weights_path), engine=DNN_ENGINE)
+        net.setPreferableTarget(DNN_TARGET)
+        return net, "opencv-cpu"
 
     import torch
     if device is None:
@@ -97,7 +104,7 @@ def _infer_dnn(net, bgr):
     blob = cv.dnn.blobFromImage(bgr, scalefactor=1 / 255.0, swapRB=True)
     t_infer = time.perf_counter()
     net.setInput(blob)
-    # OpenCV 5's engine wants every output requested at once
+    # OpenCV 5's new engine wants every output requested at once (the classic one doesn't mind)
     da, ll, *det_maps = net.forward(DNN_OUTPUTS)
     infer_s = time.perf_counter() - t_infer
 
