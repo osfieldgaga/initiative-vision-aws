@@ -2,8 +2,8 @@
 
 A Raspberry Pi camera in a real car uploads about one frame per second over cellular. On AWS,
 OpenCV 5 with COOL on Graviton finds the lane lines, the car's position in the lane, vehicles,
-stop signs and speed limits, and shows them on a live page. About 0.9 s after capture
-(virtual-Pi run, 2026-10-22).
+stop signs and speed limits, and shows them on a live page, about 1.2 to 1.4 s after the camera
+captured the frame (measured from the Pi, 2026-10-22).
 
 Entry for the [OpenCV AI Competition 2026](https://opencv26.devpost.com).
 Report: *link to come*. Video: *link to come*. Live demo: *link to come*.
@@ -11,6 +11,8 @@ Report: *link to come*. Video: *link to come*. Live demo: *link to come*.
 > Not a safety system: it never controls the vehicle, and the driver must not rely on it.
 
 ## How it works
+
+![Architecture: the Pi uploads and queues each frame; OpenCV 5 with COOL on Graviton does the vision](docs/architecture.png)
 
 ```
 Pi (in the car)  upload_live_frame.py: 640x640 JPEG, 1 frame/s
@@ -117,7 +119,7 @@ get before live mode skips it, and `LLD_WEIGHTS=data/weights/yolopv2.pt` switche
 
 | | |
 |---|---|
-| Capture to result, live (virtual Pi, direct mode, c8g.4xlarge) | ~0.9 s |
+| Capture to result, live from the Pi (direct mode, 640 uploads) | ~1.2 to 1.4 s |
 | YOLOPv2 inference, COOL cv.dnn classic engine + FP16 target | 0.742 / 0.418 / 0.222 s on c8g.xlarge / 2xlarge / 4xlarge |
 | Same model, PyTorch, c8g.xlarge | 0.89 s |
 | cv.dnn vs TorchScript output, 40 real frames | mask IoU 1.0000, identical metrics |
