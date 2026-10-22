@@ -1,0 +1,10 @@
+# Laptop: tests, the virtual Pi, benchmarks and evaluation scripts (Python 3.13).
+#   python -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
+opencv-contrib-python==5.0.0.93
+numpy==2.5.3
+boto3==1.43.117
+
+# Only to re-export the ONNX model from yolopv2.pt (src/scripts/export_onnx.py) and to compare
+# against TorchScript (src/scripts/compare_onnx.py). Not needed to run anything else.
+# torch==2.14.0
+# onnx==1.23.2

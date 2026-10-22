@@ -1,0 +1,7 @@
+# EC2 runtime (lld_aws.py live / replay), installed INTO the COOL AMI's venv:
+#   /opt/cool/venvs/python_3.12/bin/pip install -r requirements.txt
+#
+# OpenCV is NOT listed on purpose: it comes from the COOL AMI (OpenCV 5.1.0-dev, KleidiCV, DNN
+# MLAS; see phase2/ec2-compute-benchmark.md). Installing opencv-python here would shadow it.
+# numpy also comes with the COOL venv.
+boto3==1.43.117

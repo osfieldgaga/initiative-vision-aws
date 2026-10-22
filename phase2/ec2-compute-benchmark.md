@@ -25,6 +25,13 @@
 3. The script loads the model once per engine/target combination and runs one warm-up pass. It then times 5 forward passes and prints the median and the minimum. The input is random, because a conv net's cost doesn't depend on the pixel values.
 4. To check that accuracy holds on real frames, run `src/scripts/dnn_check.py <frames_dir> 30`. It times the configurations interleaved, frame by frame, and gives lane/drivable-area IoU and detection agreement against the new engine in FP32.
 
+**Stock OpenCV baseline:** the COOL AMI sets `PYTHONPATH=/opt/cool/python_3.12/site-packages/cv2/python-3.12` system-wide. That makes COOL's `cv2` win over any pip-installed OpenCV, even in a fresh venv. A first baseline attempt on 2026-10-22, in a new venv with `opencv-python-headless==5.0.0.93`, still loaded COOL's 5.1.0-dev, and its numbers were discarded. Run the baseline with the variable cleared, and check the version before trusting anything:
+```bash
+python -m venv ~/stock && ~/stock/bin/pip install opencv-python-headless==5.0.0.93 numpy
+env -u PYTHONPATH ~/stock/bin/python -c "import cv2; print(cv2.__version__, cv2.__file__)"  # 5.0.0, ~/stock/...
+env -u PYTHONPATH ~/stock/bin/python src/scripts/dnn_bench.py
+```
+
 `[ WARN ... ]` lines are expected:
 - "Targets are not supported by the new graph engine": the new engine ignores the FP16 target and runs FP32.
 - "fall back to DNN_TARGET_CPU": printed for classic FP16. *Open question:* on the c8g.xlarge that run was still 24% faster than classic FP32, so the warning may not mean what it says. `dnn_check.py` should settle it.
@@ -36,9 +43,12 @@
 | c8g.xlarge | 4 | Graviton4 | 1.203 | 1.199 | 0.969 | **0.742** | ~0.16 |
 | c8g.2xlarge | 8 | Graviton4 | 0.750 | 0.622 | 0.565 | **0.418** | ~0.32 |
 | c8g.4xlarge | 16 | Graviton4 | 0.346 | 0.358 | 0.320 | **0.222** | ~0.64 |
+| c8g.4xlarge, **stock** `opencv-python-headless==5.0.0.93` (not COOL) | 16 | Graviton4 | 0.291 | 0.282 | 0.323 | **0.223** | ~0.64 |
 | Dev laptop (i7-10750H, x86, not EC2) | 12 threads | x86-64 | 0.414 | 0.413 | 0.743 | 0.748 (falls back to FP32) | n/a |
 
 All three c8g rows are from 2026-10-22. For classic / cpu_fp16 the min was within 0.003 s of the median on the xlarge and 2xlarge, and within 0.011 s on the 4xlarge. On the 2xlarge the new engine was noisy: "new / cpu" and "new / cpu_fp16" are the same computation, because the new engine ignores the target, yet they gave 0.750 and 0.622 s (min 0.678 and 0.616).
+
+**COOL vs stock OpenCV (c8g.4xlarge, 2026-10-22): no difference for DNN inference.** With the classic engine and FP16 target, COOL took 0.222 s and stock took 0.223 s. The new engine was faster in stock (0.291 vs 0.346 s; it was also the noisiest configuration). The reason: the stock aarch64 PyPI wheel already bundles KleidiCV (26.03, newer than COOL's 0.7.0) and the same vendored DNN MLAS kernels. On Graviton, a plain `pip install` gets the Arm optimisations COOL advertises for this workload. Any COOL advantage would have to be in the image operations around inference (undistort, resize, warp, colour conversion, JPEG decode), which take about 0.07 s per frame in total. That is still to measure.
 
 **Scaling, classic / cpu_fp16:**
 
@@ -76,6 +86,7 @@ Fill in from a virtual-Pi run in `--direct` mode (`src/scripts/virtual_pi.py`), 
 
 - [x] c8g.2xlarge and c8g.4xlarge results (`dnn_bench.py`, 2026-10-22)
 - [ ] `dnn_check.py` on real frames: is FP16 really faster, and do the masks still agree?
-- [ ] **COOL vs stock OpenCV** on the same instance: `pip install opencv-python-headless` in a *separate* venv (never COOL's) and rerun `dnn_bench.py`. This is the baseline the COOL award asks for.
+- [x] **COOL vs stock OpenCV** for DNN inference, c8g.4xlarge: equal (0.222 vs 0.223 s classic FP16)
+- [ ] COOL vs stock for the pipeline's image operations (undistort, resize, warpPerspective, cvtColor, imdecode/imencode, Canny)
 - [ ] Optional: the same model on an x86 instance of the same size (e.g. c7i.xlarge), for an Arm vs x86 cost comparison
 - [ ] Cost per drive-hour for each instance (EC2 + COOL fee) next to the live lag

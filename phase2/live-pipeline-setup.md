@@ -1,6 +1,22 @@
-# Live pipeline setup: Pi → S3 → Lambda → SQS → EC2
+# Live pipeline setup: Pi → S3 + SQS → EC2
 
 The Pi only captures and uploads; all processing happens in the cloud.
+
+**Direct mode (default since 2026-10-22):** the Pi uploads each frame, downscaled to 640x640 JPEG q70
+(~25 KB), straight to its archive key and sends the SQS message itself. No S3 event and no Lambda
+sit in the live path. The S3 → Lambda hop measured ~1 s, almost all of it S3 event delivery
+(Lambda itself ran in 107 ms on average over 806 calls).
+
+```
+Pi  upload_live_frame.py  (LLD_QUEUE_URL set)
+        ├─ PUT live/<session-start>/<frame-time>.jpg   (640x640 q70, metadata as below)
+        └─ send {bucket, key, session_start, frame_time, frame_seq, uploaded_at, queued_at} → SQS FIFO
+        ▼
+EC2  lld_aws.py live ── receive → lld.process_frame → live view (SSH tunnel) + per-session outputs
+                         lld/<session-start>/overlay.mp4, bev.mp4, metrics.json
+```
+
+**Lambda mode (fallback, `LLD_QUEUE_URL` unset on the Pi):** the original path, still deployed.
 
 ```
 Pi  upload_live_frame.py ── PUT live/latest_frame.jpg  (metadata: session-start, frame-time, frame-seq)
@@ -117,15 +133,37 @@ IAM → Roles → the role attached to the instance (or create one: trusted enti
       "Effect": "Allow",
       "Action": ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"],
       "Resource": "arn:aws:sqs:us-east-1:<account-id>:lld-frames.fifo"
+    },
+    {
+      "Sid": "Metrics",
+      "Effect": "Allow",
+      "Action": "cloudwatch:PutMetricData",
+      "Resource": "*",
+      "Condition": {"StringEquals": {"cloudwatch:namespace": "InitiativeVision"}}
     }
   ]
 }
 ```
+`PutMetricData` can't be limited to a resource, so the condition limits it to our namespace instead.
 `ListBucket` matters even though lld_aws only lists in replay mode: without it, reading a key that
 doesn't exist returns AccessDenied instead of NoSuchKey, and the live mode's "is there already a
 metrics.json for this session?" check can't tell the difference.
 
 ## 5. Run it on the instance
+
+Install ffmpeg once (`sudo apt install -y ffmpeg`). Session videos are converted to H.264 with it
+when a session is finalized, so they play in a browser; without it they stay mp4v.
+
+**CloudWatch:** `lld_aws.py live` sends per-frame metrics to the `InitiativeVision` namespace
+(dimension `Pipeline=live`) every 10 s: `LagSeconds` and its hops (`CaptureToWriteSeconds`,
+`PiToS3Seconds`, `S3ToQueueSeconds`, `QueueSeconds`), `InferenceSeconds`, `SignsSeconds`,
+`ProcessingSeconds`, `FramesProcessed`, `FramesSkipped`, `LaneValid` (%) and `Backlog`. Timings are
+sent as value lists, so p50/p95 work. Cost: one API call per 10 s and 13 custom metrics (about
+$4/month if kept all month). `LLD_METRICS=0` turns it off. Create the dashboard once, from the repo:
+```
+aws cloudwatch put-dashboard --region us-east-1 --dashboard-name InitiativeVision \
+  --dashboard-body file://infra/cloudwatch-dashboard.json
+```
 
 The model runs on OpenCV's DNN module (`cv.dnn`) from an ONNX file, so the instance doesn't need
 torch. Make the ONNX once on a machine that has torch:
@@ -179,9 +217,36 @@ newer ones are waiting, so the live view stays current. They're still archived i
 
 ## 6. Pi
 
-`upload_live_frame.py` now tags every upload with `session-start` (the moment the uploader started),
-`frame-time` and `frame-seq`, and survives network drops. Start it alongside `start.py`; each start
-is a new session.
+`upload_live_frame.py` (repo root on the Pi) uploads `latest_frame.jpg`, which `start.py` rewrites
+about twice a second (`record --live-preview`), at most once per second. It tags every upload with
+`session-start` (the moment the uploader started), `frame-time` and `frame-seq`, and survives
+network drops. Start it alongside `start.py`; each start is a new session.
+
+- **Direct mode:** run it with `LLD_QUEUE_URL=https://sqs.us-east-1.amazonaws.com/<account-id>/lld-frames.fifo`.
+  Without that variable it uses the Lambda path.
+- **Size:** `LIVE_SIZE` defaults to 640, giving 640x640 q70 (~25 KB instead of the ~190 KB q90
+  recording frame). The resize uses Pillow's JPEG draft mode and takes ~73 ms on the Pi 3B.
+  `LIVE_SIZE=0` uploads the frame as recorded. `lld.py` scales the camera intrinsics to the frame
+  size, so the calibration holds. The bird's-eye view homography is defined on the 640 model input.
+- **Fresh frames only:** a frame written more than 0.25 s ago is skipped in favour of the next one.
+- **Venv:** the Pi's `.venv` needs `boto3` and `pillow` (`.venv/bin/pip install pillow`, done 2026-10-22).
+- **IAM** for the Pi's credentials:
+  ```json
+  {"Version": "2012-10-17", "Statement": [
+    {"Effect": "Allow", "Action": "s3:PutObject", "Resource": "arn:aws:s3:::initiative-vision-1/live/*"},
+    {"Effect": "Allow", "Action": "sqs:SendMessage",
+     "Resource": "arn:aws:sqs:us-east-1:<account-id>:lld-frames.fifo"}]}
+  ```
+- **Clock:** with direct mode, the "in queue" lag compares the Pi's clock with EC2's. The Pi has
+  NTP active and `timedatectl` said synchronized on 2026-10-22, but check it before a drive.
+- **Capture time (2026-10-22):** the recorder (`write_live_preview` in `ivision/frames/pipeline.py`)
+  sets the preview's mtime to the frame's sensor capture time, converted from the monotonic clock
+  to epoch time, and the ctime stays the write time. The uploader sends `frame-time` = capture
+  time and `written_at` = write time. The live page then shows **capture → write** (encode plus
+  any SD-card backlog: the recorder writes the preview in its disk-writer thread, after the
+  frame's own file) as its own row, and every lag figure starts at the sensor.
+- **Testing without the car:** `src/scripts/virtual_pi.py <session> --direct --size 640` does the
+  same from the laptop with a recorded drive.
 
 ## Rough running cost at ~2 frames/s
 

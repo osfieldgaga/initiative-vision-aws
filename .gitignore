@@ -3,3 +3,5 @@
 /data/weights/yolopv2.onnx
 /data/weights/ocr/
 /test_sessions
+__pycache__/
+*.pyc

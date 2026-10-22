@@ -27,11 +27,21 @@ Watching it: the script serves the overlay, BEV and metrics on 127.0.0.1:LIVE_PO
 LIVE_PORT=0 disables it. LIVE_HOLD=1 keeps the page up after a replay until Ctrl+C.
 OpenCV windows still open if a display is available (DISPLAY set), otherwise headless.
 
+Videos are written as mp4v (what OpenCV can always write) and converted to H.264 with ffmpeg
+when the session is finalized, so they play in a browser. Without ffmpeg (sudo apt install ffmpeg)
+they're uploaded as mp4v.
+
+CloudWatch: per-frame lag, its hops, inference and processing time go to the InitiativeVision
+namespace every METRICS_FLUSH_S (put_metric_data with value lists, so p50/p95 work). Needs
+cloudwatch:PutMetricData on the instance role; LLD_METRICS=0 turns it off.
+
 Credentials: on EC2 attach an instance role; boto3 picks it up automatically.
 """
 import argparse
 import json
 import os
+import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -48,7 +58,7 @@ from live_view import LiveView
 
 ## Config
 BUCKET = "initiative-vision-1"
-QUEUE_URL = os.environ.get("LLD_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/686584420503/lld-frames.fifo")  # SQS queue the Lambda feeds
+QUEUE_URL = os.environ.get("LLD_QUEUE_URL", "")  # SQS queue the Pi (or the Lambda) feeds, required for live
 FRAMES_PREFIX = "live/<session_start>/"  # default for replay mode
 OUTPUT_PREFIX = "lld"
 WEIGHTS_PATH = os.environ.get("LLD_WEIGHTS", lld.DEFAULT_WEIGHTS)  # .onnx -> cv.dnn, .pt -> TorchScript
@@ -70,6 +80,10 @@ RECEIVE_BATCH = 10       # SQS messages per receive (max 10)
 # `replay` processes everything. 0 = never skip (complete metrics, but the lag can grow).
 MAX_LAG_S = float(os.environ.get("LLD_MAX_LAG_S", 10))
 VISIBILITY_S = 120       # a received batch must be processed within this, or SQS re-delivers it
+
+PUBLISH_METRICS = os.environ.get("LLD_METRICS", "1") != "0"
+METRICS_NAMESPACE = "InitiativeVision"
+METRICS_FLUSH_S = 10     # seconds between put_metric_data calls
 
 
 ## S3 helpers
@@ -223,12 +237,110 @@ class SessionOutput:
 
         part = {"frames": self.new_frames}
         for name, path in self.video_paths.items():
+            to_h264(path)
             key = f"{self.prefix}/{path.name}"
             self.s3.upload_file(str(path), self.bucket, key, ExtraArgs={"ContentType": "video/mp4"})
             part[name] = key
             print(f"uploaded s3://{self.bucket}/{key}")
         self.videos.append(part)
         print(f"uploaded s3://{self.bucket}/{self.upload_metrics()}")
+
+
+def to_h264(path):
+    """Re-encode an mp4v file to H.264 in place (browsers don't play mp4v). True if converted.
+    yuv420p + faststart: plays everywhere and starts before the whole file has downloaded."""
+    if not shutil.which("ffmpeg"):
+        print(f"ffmpeg not found, uploading {Path(path).name} as mp4v (won't play in browsers)")
+        return False
+    tmp = Path(path).with_suffix(".h264.mp4")
+    result = subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error", "-i", str(path), "-c:v", "libx264", "-pix_fmt", "yuv420p",
+         "-crf", "23", "-preset", "veryfast", "-movflags", "+faststart", str(tmp)],
+        capture_output=True, text=True)
+    if result.returncode != 0 or not tmp.exists():
+        print(f"H.264 conversion of {Path(path).name} failed, uploading mp4v: {result.stderr.strip()[-300:]}")
+        tmp.unlink(missing_ok=True)
+        return False
+    os.replace(tmp, path)
+    return True
+
+
+## CloudWatch
+
+class MetricsPublisher:
+    """Collects per-frame values and sends them to CloudWatch every METRICS_FLUSH_S, from a
+    background thread so the frame loop never waits on it. Values are sent as lists, which keeps
+    the distribution: dashboards can show p50 / p95, not just averages. A failure (no permission,
+    network) is printed once and never stops processing."""
+
+    UNITS = {"FramesProcessed": "Count", "FramesSkipped": "Count", "LaneValid": "Percent",
+             "Backlog": "Count"}
+
+    def __init__(self, cloudwatch, namespace=METRICS_NAMESPACE, flush_s=METRICS_FLUSH_S,
+                 dimensions=(("Pipeline", "live"),)):
+        self.cw = cloudwatch
+        self.namespace = namespace
+        self.flush_s = flush_s
+        self.dimensions = [{"Name": k, "Value": v} for k, v in dimensions]
+        self.lock = threading.Lock()
+        self.values = {}
+        self.warned = False
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        self.thread.start()
+        return self
+
+    def add(self, name, value):
+        if value is None:
+            return
+        with self.lock:
+            self.values.setdefault(name, []).append(float(value))
+
+    def record_frame(self, timing, lag_s, metrics, backlog=None):
+        """One processed frame: the end-to-end lag, its hops, and the processing breakdown."""
+        self.add("LagSeconds", lag_s)
+        for key, name in (("capture_to_write_s", "CaptureToWriteSeconds"), ("pi_to_s3_s", "PiToS3Seconds"),
+                          ("s3_to_queue_s", "S3ToQueueSeconds"), ("queue_s", "QueueSeconds"),
+                          ("download_s", "DownloadSeconds"), ("infer_s", "InferenceSeconds"),
+                          ("signs_s", "SignsSeconds"), ("total_s", "ProcessingSeconds")):
+            self.add(name, timing.get(key))
+        self.add("FramesProcessed", 1)
+        self.add("LaneValid", 100.0 if metrics.get("lane_valid") else 0.0)
+        self.add("Backlog", backlog)
+
+    def datums(self, values):
+        out = []
+        for name, vals in values.items():
+            unit = self.UNITS.get(name, "Seconds")
+            if unit == "Count" and name.startswith("Frames"):  # counts: one summed datum
+                out.append({"MetricName": name, "Dimensions": self.dimensions, "Value": sum(vals), "Unit": unit})
+                continue
+            for i in range(0, len(vals), 150):  # put_metric_data takes at most 150 values per datum
+                out.append({"MetricName": name, "Dimensions": self.dimensions,
+                            "Values": vals[i:i + 150], "Unit": unit})
+        return out
+
+    def flush(self):
+        with self.lock:
+            values, self.values = self.values, {}
+        data = self.datums(values)
+        for i in range(0, len(data), 1000):  # at most 1000 datums per call
+            try:
+                self.cw.put_metric_data(Namespace=self.namespace, MetricData=data[i:i + 1000])
+            except Exception as e:
+                if not self.warned:
+                    print(f"CloudWatch metrics not sent (will keep trying quietly): {e}")
+                    self.warned = True
+
+    def _run(self):
+        while not self.stop.wait(self.flush_s):
+            self.flush()
+
+    def close(self):
+        self.stop.set()
+        self.flush()
 
 
 ## Display helpers
@@ -293,8 +405,13 @@ def lag_breakdown(body, received_at, started_at):
     uploaded_at, queued_at = body.get("uploaded_at"), body.get("queued_at")
     if uploaded_at is None or queued_at is None:
         return {}  # message from an older Lambda version
+    hops = {}
+    written_at = body.get("written_at")  # direct-mode Pi: when the recorder wrote the preview file
+    if written_at is not None:
+        hops["capture_to_write_s"] = round(written_at - body["frame_time"], 3)  # encode + disk backlog
     return {
-        "pi_to_s3_s": round(uploaded_at - body["frame_time"], 3),  # wait for upload + the upload itself
+        **hops,
+        "pi_to_s3_s": round(uploaded_at - (written_at if written_at is not None else body["frame_time"]), 3),
         "s3_to_queue_s": round(queued_at - uploaded_at, 3),        # S3 event -> Lambda -> SQS
         "queue_s": round(received_at - queued_at, 3),              # sitting in SQS
         "batch_wait_s": round(started_at - received_at, 3),        # behind earlier frames of the same batch
@@ -309,7 +426,8 @@ def newer_frame_waiting(sqs, queue_url, position, messages):
     return bool(queue_depth(sqs, queue_url))
 
 
-def run_live(s3, sqs, queue_url, model, device, work_dir, show=SHOW, live=None, max_receives=None, sign_reader=None):
+def run_live(s3, sqs, queue_url, model, device, work_dir, show=SHOW, live=None, max_receives=None, sign_reader=None,
+             cw_metrics=None):
     """Process frames from the SQS queue as they arrive, forever (or max_receives receive calls).
     Returns the last session's metrics doc."""
     current = None
@@ -364,6 +482,8 @@ def run_live(s3, sqs, queue_url, model, device, work_dir, show=SHOW, live=None, 
                 age = time.time() - body["frame_time"]
                 if MAX_LAG_S and age > MAX_LAG_S and newer_frame_waiting(sqs, queue_url, position, messages):
                     current.skipped += 1
+                    if cw_metrics:
+                        cw_metrics.add("FramesSkipped", 1)
                     print(f"{session}: skipping {PurePosixPath(key).name}, {age:.1f}s old and newer frames are waiting")
                     sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=msg["ReceiptHandle"])
                     continue
@@ -403,6 +523,9 @@ def run_live(s3, sqs, queue_url, model, device, work_dir, show=SHOW, live=None, 
                 processed += 1
                 if processed % BACKLOG_EVERY == 1:
                     backlog = queue_depth(sqs, queue_url)
+                if cw_metrics:
+                    cw_metrics.record_frame(timing, round(lag, 3), metrics,
+                                            backlog=backlog if processed % BACKLOG_EVERY == 1 else None)
 
                 print(f"{session} #{len(current.frames) - 1} | lag {lag:.1f}s | backlog {backlog} | "
                       f"dl {timing['download_s']:.2f} infer {timing['infer_s']:.2f} signs {timing['signs_s']:.2f} "
@@ -438,8 +561,9 @@ def main(argv=None):
 
     if OUTPUT_PREFIX.rstrip("/") in ("sessions", "live"):
         raise SystemExit("OUTPUT_PREFIX must be separate from sessions/ and live/")
-    if mode == "live" and "<" in QUEUE_URL:
-        raise SystemExit("set LLD_QUEUE_URL (or QUEUE_URL in lld_aws.py) to the queue the Lambda feeds")
+    if mode == "live" and not QUEUE_URL:
+        raise SystemExit("set LLD_QUEUE_URL to the SQS queue URL, e.g. "
+                         "https://sqs.us-east-1.amazonaws.com/<account-id>/lld-frames.fifo")
     if mode == "replay" and "<" in args.prefix:
         raise SystemExit("give a prefix: python lld_aws.py replay live/<session_start>/")
 
@@ -464,7 +588,16 @@ def main(argv=None):
         with tempfile.TemporaryDirectory(prefix="lld_") as work_dir:
             if mode == "live":
                 sqs = boto3.client("sqs", region_name=REGION)
-                run_live(s3, sqs, QUEUE_URL, model, device, work_dir, live=live, sign_reader=sign_reader)
+                cw_metrics = None
+                if PUBLISH_METRICS:
+                    cw_metrics = MetricsPublisher(boto3.client("cloudwatch", region_name=REGION)).start()
+                    print(f"CloudWatch metrics: namespace {METRICS_NAMESPACE}, every {METRICS_FLUSH_S}s")
+                try:
+                    run_live(s3, sqs, QUEUE_URL, model, device, work_dir, live=live, sign_reader=sign_reader,
+                             cw_metrics=cw_metrics)
+                finally:
+                    if cw_metrics:
+                        cw_metrics.close()
             else:
                 run_replay(s3, BUCKET, args.prefix, model, device, work_dir, live=live, sign_reader=sign_reader)
 

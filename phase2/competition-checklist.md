@@ -59,7 +59,7 @@ Every entry must use **OpenCV 5 for substantive image/video analysis** and **run
 ## Prizes: which to run for (decided 2026-10-22)
 
 - **Main prizes (1st–3rd):** automatically entered. Everything above feeds this.
-- **Best Use of COOL ($1k): go for it.** We're already 80% of the way there: the core workload runs on a COOL AMI on Graviton (c8g.xlarge), and since the cv.dnn port the core workload *is* OpenCV, so COOL actually runs it. What's missing is evidence: COOL version and instance config, `cv2.getBuildInformation()` showing COOL, and one reproducible benchmark (the pipeline's per-frame stages with COOL vs stock `opencv-python` on the same c8g, ideally plus an x86 c7i baseline, reported as latency, frames/s and $/drive-hour). That's about one day, and most of it doubles as main-track evaluation.
+- **Best Use of COOL ($1k): no longer an easy win (re-assessed 2026-10-22).** The workload does run on COOL on Graviton, with scaling measured at 4, 8 and 16 vCPUs. But stock `opencv-python-headless` 5.0.0 on the same c8g.4xlarge ran YOLOPv2 just as fast (0.223 vs 0.222 s, classic FP16), because the stock aarch64 wheel already bundles KleidiCV and the same DNN MLAS kernels. The image operations around inference total only about 12 ms per 640 frame (`src/scripts/ops_bench.py`, laptop), so even a large COOL speed-up there barely changes the frame time. Still worth submitting as an honest, reproducible comparison, but it's unlikely to win. Finish `ops_bench.py` in both environments, then decide.
 - **Agentic Vision ($1k): skip.** Nothing exists yet. It needs an agent loop where vision output changes a later action, plus a workflow diagram, a trace, and evaluation of success, failure handling and human control. That's 1.5–2 days we don't have, and a rushed version risks being judged as "a chatbot explaining a fixed result". Revisit only if everything else is finished by Oct 25. The cheapest qualifying idea: a controller that reacts to low `lane_valid` or a sign sighting by requesting full-rate uploads for the next N seconds, and flags segments for human review.
 
 ---
@@ -68,11 +68,11 @@ Every entry must use **OpenCV 5 for substantive image/video analysis** and **run
 
 - [ ] **Technical report** covering problem, users, architecture, OpenCV 5 implementation, AWS deployment, evaluation, limitations, and responsible use
 - [ ] **Judge-accessible repo** (`github.com/osfieldgaga/initiative-vision-aws`). Make it public or add judges.
-  - [ ] README with what it is, a quickstart, and links to the report, video and endpoint
-  - [ ] `yolopv2.pt` and `yolopv2.onnx` are gitignored, so document where to download it (or host it in S3)
-  - [ ] Cleanup: add `__pycache__/` to `.gitignore` and untrack the `.pyc` files; decide on the 200 MB of `data/` and `outputs/`; move scratch scripts (`draw.py`, `read.py`, `rescale.py`, `yolop_test.py`, ...) somewhere out of the way
-  - [ ] Remove the hardcoded account id from the `QUEUE_URL` default in `lld_aws.py`
-- [ ] **Pinned dependencies**: `requirements.txt` for EC2 (boto3, torch, numpy, plus the COOL AMI version) and for local/tests. Add `boto3` to `.venv`, which fixes the one failing test.
+  - [x] README with what it is, a quickstart, and links to the report, video and endpoint (2026-10-22; the links are placeholders until those exist)
+  - [x] `yolopv2.pt` and `yolopv2.onnx` are gitignored: the README has the download URLs and the export step
+  - [x] Cleanup (2026-10-22): `__pycache__/` gitignored and untracked; scratch scripts moved to `archive/early-experiments/`. Still open: whether to keep the ~430 MB of `data/` and `outputs/` in git
+  - [x] Remove the hardcoded account id from the `QUEUE_URL` default in `lld_aws.py` (now required via `LLD_QUEUE_URL`)
+- [x] **Pinned dependencies** (2026-10-22): `requirements.txt` (EC2, installed into COOL's venv; OpenCV comes from the COOL AMI) and `requirements-dev.txt` (laptop). `boto3` is in `.venv`, so all 8 test files (83 tests) pass
 - [ ] **Build / deploy / test instructions**: `live-pipeline-setup.md` is a good base. Add a how-to-run-the-tests section (5 suites, 62 tests, all pass except `test_upload_session` because boto3 is missing).
 - [ ] **Architecture diagram** showing OpenCV 5 and AWS components, plus COOL if we claim it. A real image, not ASCII.
 - [ ] **Working web endpoint** (or an arranged live screen-share). See section 2.
@@ -92,7 +92,7 @@ Judges mostly care about the AWS side. They won't have the car, so they get a **
 - [ ] **Public endpoint**: right now `live_view.py` binds 127.0.0.1 and is reached through `ssh -L`. Judges need a URL.
   - HTTPS with basic auth, or a shared-secret link (so we don't expose an open EC2 port)
   - Show the live stream while a replay runs, plus **finished sessions** (`lld/<session>/` videos + metrics) for when nobody is replaying
-  - Re-encode outputs to **H.264** so they play in a browser (mp4v doesn't)
+  - [x] Outputs re-encoded to **H.264** with ffmpeg at session finalize (2026-10-22); install ffmpeg on EC2
 - [ ] **Availability for Oct 27 to Nov 9**: either keep EC2 up (check cost: c8g.xlarge is roughly $0.16/h on-demand, ~$50 for two weeks, plus the COOL fee if it isn't covered by credits) or serve finished results from S3/static hosting and start EC2 only for live demos. Pick one and write it in the report.
 
 ## 3. The highway recording (one of the core submission recordings)
@@ -120,6 +120,10 @@ After the drive:
 
 ## 5. Correctness fixes (known open items)
 
+- [x] **Latency (2026-10-22): from ~3.2 s to ~0.87 s capture-to-result.** The S3 event delivery to Lambda (~1 s) was removed from the live path: the Pi now uploads to the archive key and sends the SQS message itself. Uploads are 640x640 q70 (~25 KB instead of ~190 KB), and `lld.py` scales the intrinsics to match. EC2 inference uses the classic cv.dnn engine with the FP16 target; c8g.4xlarge for drives. Details are in `live-pipeline-setup.md` and `ec2-compute-benchmark.md`.
+  - [ ] First real Pi run in direct mode, after adding the IAM policy (`s3:PutObject` live/*, `sqs:SendMessage`) to the Pi's user
+  - [ ] Validate 640 uploads on real speed-limit signs: the 48 px minimum means signs must be about twice as close as at 1280
+
 - [x] Missing lane reported as -4.00 m offset (fixed 2026-10-21). Per-side offsets are `None` when that side isn't detected; `offset_m`/`road_width_m` are `None` unless both are. Overlay, `format_metrics` and the live page show n/a. Note: sessions processed before the fix still have the bad values in their `metrics.json`.
 - [ ] Lambda memory 128 → 256 MB
 - [ ] Stop EC2 when idle (or a schedule / CloudWatch alarm on queue-empty)
@@ -127,7 +131,7 @@ After the drive:
 ## 6. Cloud delivery, reproducibility, responsible operation (10%)
 
 - [ ] **Reproducible infra**: a CloudFormation/SAM template or a single `aws` CLI script that creates the bucket config, queues, Lambda, roles and trigger. Currently it's all console steps in `live-pipeline-setup.md`. This is one of the cheapest points available.
-- [ ] **Observability**: push per-frame lag/inference as CloudWatch custom metrics (or embedded-metric-format logs) + one dashboard screenshot; DLQ depth alarm
+- [x] **Observability** (2026-10-22): per-frame lag, its hops, inference and processing time go to CloudWatch (`InitiativeVision`, p50/p95 via value lists); dashboard in `infra/cloudwatch-dashboard.json`. Still to do: dashboard screenshot for the report, DLQ depth alarm
 - [ ] **Security**: endpoint auth; no creds in repo (check git history); IAM policies already least-privilege, so say so in the report
 - [ ] **Responsible use**: footage contains other drivers' plates and maybe pedestrians' faces. Either blur them (OpenCV can do it: a plate/face detector plus `GaussianBlur`) or state that only lane overlays/BEV are published. Also include a "this is not a safety system, no vehicle actuation" statement, which the brief already holds.
 

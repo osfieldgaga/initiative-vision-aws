@@ -5,6 +5,7 @@ blank images of the right sizes, so these run in milliseconds.
 """
 
 import json
+import subprocess
 import sys
 import tempfile
 import time
@@ -238,6 +239,11 @@ class LagBreakdownTest(unittest.TestCase):
         got = lld_aws.lag_breakdown(body, received_at=102.0, started_at=102.25)
         self.assertEqual(got, {"pi_to_s3_s": 1.5, "s3_to_queue_s": 0.3, "queue_s": 0.2, "batch_wait_s": 0.25})
 
+    def test_capture_to_write_split_out_when_the_pi_sends_it(self):
+        body = {"frame_time": 100.0, "written_at": 100.4, "uploaded_at": 101.5, "queued_at": 101.5}
+        got = lld_aws.lag_breakdown(body, received_at=101.6, started_at=101.6)
+        self.assertEqual((got["capture_to_write_s"], got["pi_to_s3_s"]), (0.4, 1.1))
+
     def test_old_lambda_messages_have_no_breakdown(self):
         self.assertEqual(lld_aws.lag_breakdown({"frame_time": 100.0}, 102.0, 102.0), {})
 
@@ -313,3 +319,69 @@ class FormatMetricsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class H264Test(unittest.TestCase):
+    def write_mp4v(self, path):
+        w = cv.VideoWriter(str(path), cv.VideoWriter_fourcc(*"mp4v"), 2, (64, 64))
+        for i in range(4):
+            w.write(np.full((64, 64, 3), i * 60, np.uint8))
+        w.release()
+
+    @unittest.skipUnless(lld_aws.shutil.which("ffmpeg") and lld_aws.shutil.which("ffprobe"), "needs ffmpeg")
+    def test_converts_to_h264_in_place(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "overlay.mp4"
+            self.write_mp4v(path)
+            self.assertTrue(lld_aws.to_h264(path))
+            codec = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                                    "stream=codec_name", "-of", "csv=p=0", str(path)],
+                                   capture_output=True, text=True).stdout.strip()
+            self.assertEqual(codec, "h264")
+            self.assertEqual(sorted(p.name for p in Path(d).iterdir()), ["overlay.mp4"])  # no temp file left
+
+    def test_without_ffmpeg_leaves_the_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "overlay.mp4"
+            self.write_mp4v(path)
+            before = path.read_bytes()
+            with mock.patch.object(lld_aws.shutil, "which", return_value=None):
+                self.assertFalse(lld_aws.to_h264(path))
+            self.assertEqual(path.read_bytes(), before)
+
+
+class MetricsPublisherTest(unittest.TestCase):
+    def test_values_are_lists_counts_are_summed(self):
+        pub = lld_aws.MetricsPublisher(mock.Mock())
+        for lag in (0.8, 0.9):
+            pub.record_frame({"infer_s": 0.2, "total_s": 0.3, "pi_to_s3_s": 0.4}, lag, {"lane_valid": lag < 0.85})
+        pub.add("FramesSkipped", 1)
+        pub.flush()
+        data = {d["MetricName"]: d for d in pub.cw.put_metric_data.call_args.kwargs["MetricData"]}
+        self.assertEqual(pub.cw.put_metric_data.call_args.kwargs["Namespace"], "InitiativeVision")
+        self.assertEqual(data["LagSeconds"]["Values"], [0.8, 0.9])
+        self.assertEqual(data["InferenceSeconds"]["Unit"], "Seconds")
+        self.assertEqual(data["LaneValid"]["Values"], [100.0, 0.0])
+        self.assertEqual(data["FramesProcessed"]["Value"], 2)
+        self.assertEqual(data["FramesSkipped"]["Value"], 1)
+        self.assertNotIn("CaptureToWriteSeconds", data)  # not in this timing: nothing sent
+
+    def test_long_lists_are_split_and_buffer_is_emptied(self):
+        pub = lld_aws.MetricsPublisher(mock.Mock())
+        for i in range(400):
+            pub.add("LagSeconds", i)
+        pub.flush()
+        sent = pub.cw.put_metric_data.call_args.kwargs["MetricData"]
+        self.assertEqual([len(d["Values"]) for d in sent], [150, 150, 100])
+        pub.flush()
+        self.assertEqual(pub.cw.put_metric_data.call_count, 1)  # nothing new: no call
+
+    def test_failure_never_raises(self):
+        cw = mock.Mock()
+        cw.put_metric_data.side_effect = RuntimeError("AccessDenied")
+        pub = lld_aws.MetricsPublisher(cw)
+        pub.add("LagSeconds", 1.0)
+        pub.flush()  # printed once, no exception
+        pub.add("LagSeconds", 1.0)
+        pub.flush()
+        self.assertTrue(pub.warned)
