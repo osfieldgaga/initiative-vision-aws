@@ -38,27 +38,33 @@ PAGE = """<!doctype html>
 <html><head><meta charset="utf-8"><title>LLD live</title>
 <style>
   body { background:#111; color:#ddd; font-family:monospace; margin:12px; font-size:13px; }
-  /* three columns in one row: the two videos share the width, metrics get a narrower column */
-  .row { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr) minmax(260px,340px);
-         gap:12px; align-items:start; }
-  @media (max-width: 900px) { .row { grid-template-columns:minmax(0,1fr); } }
+  /* three columns in one row, sized to the window: each square video is at most 520 px, and never
+     wider than its share of the window or taller than the window; the metrics column scrolls */
+  :root { --video: min(520px, calc((100vw - 24px - 24px - 330px) / 2), calc(100vh - 48px)); }
+  .row { display:grid; grid-template-columns:var(--video) var(--video) 330px; gap:12px; align-items:start; }
+  @media (max-width: 760px) { .row { grid-template-columns:minmax(0,1fr); } :root { --video: 100%; } }
   figure { margin:0; }
   figcaption { color:#888; margin-bottom:4px; }
   img { display:block; width:100%; height:auto; aspect-ratio:1 / 1; border:1px solid #333; background:#000; }
+  .side { max-height:calc(100vh - 24px); overflow-y:auto; overflow-x:hidden; }
+  .side td:first-child { white-space:nowrap; }
+  .side td + td { overflow-wrap:anywhere; }
   table { border-collapse:collapse; }
   td { padding:1px 8px 1px 0; vertical-align:top; }
   p { margin:10px 0 4px; color:#888; }
   .bad { color:#f55; } .ok { color:#5d5; } .na { color:#888; }
   canvas { display:block; width:100%; height:auto; background:#1a1a1a; border:1px solid #333; }
-  #dl a { display:inline-block; margin:4px 6px 0 0; padding:6px 10px; border:1px solid #f56e0f;
+  #dl a, #dl span.btn { display:inline-block; margin:4px 6px 0 0; padding:6px 10px; border:1px solid #f56e0f;
           color:#f56e0f; text-decoration:none; }
   #dl a:hover { background:#f56e0f; color:#111; }
+  #dl span.btn { border-color:#444; color:#666; cursor:not-allowed; }
+  #dl .note { color:#888; margin:6px 0 0; }
 </style></head>
 <body>
 <div class="row">
   <figure><figcaption>camera + lanes, vehicles, signs</figcaption><img src="/overlay.mjpg" alt="camera overlay"></figure>
   <figure><figcaption>bird's-eye view</figcaption><img src="/bev.mjpg" alt="bird's-eye view"></figure>
-  <div>
+  <div class="side">
     <div id="dl"></div>
     <table id="m"></table>
     <p>offset (m), last 200 frames</p>
@@ -89,14 +95,18 @@ function drawPlot() {
   });
 }
 
+let lastDownloads = null;
 function drawDownloads(m) {
+  const files = m.downloads || [];
+  const key = JSON.stringify(files) + (m.session || "");
+  if (key === lastDownloads) return;  // don't rebuild the buttons every poll (keeps clicks working)
+  lastDownloads = key;
   const d = document.getElementById("dl");
-  if (m.downloads && m.downloads.length) {
-    d.innerHTML = "<p>session videos</p>" + m.downloads.map(f =>
-      `<a href="/download?key=${encodeURIComponent(f.key)}">⬇ ${f.label}</a>`).join("");
-  } else {
-    d.innerHTML = m.session ? `<p>videos: downloadable when the session ends (30 s after its last frame)</p>` : "";
-  }
+  d.innerHTML = "<p>session videos</p>" + (files.length
+    ? files.map(f => `<a href="/download?key=${encodeURIComponent(f.key)}">⬇ ${f.label}</a>`).join("")
+    : `<span class="btn" aria-disabled="true">⬇ camera overlay video</span>` +
+      `<span class="btn" aria-disabled="true">⬇ bird's-eye video</span>` +
+      `<div class="note">Ready 30 s after the session ends: 30 s after the last frame, or after you close the virtual Pi.</div>`);
 }
 
 async function poll() {
