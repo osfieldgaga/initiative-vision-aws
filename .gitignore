@@ -7,3 +7,5 @@ __pycache__/
 *.pyc
 /data/weights/privacy/
 /docs/cloudwatch-full.png
+/data/videos
+docs/video/*.html
