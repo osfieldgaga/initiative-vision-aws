@@ -6,9 +6,36 @@ stop signs and speed limits, and shows them on a live page, about 1.2 to 1.4 s a
 captured the frame (measured from the Pi, 2026-10-22).
 
 Entry for the [OpenCV AI Competition 2026](https://opencv26.devpost.com).
-Report: *link to come*. Video: *link to come*. Live demo: *link to come*.
+Report: *link to come*. Video: *link to come*. Live demo: [www.initiativelabs.cc/ivision-demo](https://www.initiativelabs.cc/ivision-demo) (password in the submission).
 
 > Not a safety system: it never controls the vehicle, and the driver must not rely on it.
+
+## For judges: run the car yourself
+
+You don't need the car or an AWS account. The virtual Pi replays a real drive on your computer and
+uploads it through the real AWS pipeline, exactly like the car does; you watch the results live.
+
+1. **Get the code and the drive** (503 MB: 7.7 minutes of driving, privacy-processed, see `PRIVACY.md` inside):
+   ```bash
+   git clone https://github.com/osfieldgaga/initiative-vision-aws.git && cd initiative-vision-aws
+   python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt     # Python 3.12 or 3.13
+   curl -L -O https://github.com/osfieldgaga/initiative-vision-aws/releases/download/judge-data/ivision-drive-20261022.zip
+   python3 -m zipfile -e ivision-drive-20261022.zip .
+   ```
+2. **Open the results page**, [www.initiativelabs.cc/ivision-demo](https://www.initiativelabs.cc/ivision-demo),
+   with the password from the submission's judging instructions, and press **Start the demo**. The cloud
+   instance takes 1-2 minutes to boot (it stops itself after 20 idle minutes).
+3. **Start the virtual Pi** (it asks for the same password and gets one-hour upload credentials from the site):
+   ```bash
+   .venv/bin/python src/scripts/virtual_pi.py 20261022T164127Z-084b --demo
+   ```
+   A window shows the camera next to the car's CAN data (speed, RPM, gear, steering, pedals, blinkers).
+   Keys: space pause, a / d or arrows seek 10 s, click the timeline to jump, q quit. Put it next to the
+   results page: the gap between them is the end-to-end lag.
+4. **When you close the virtual Pi**, the session's videos become downloadable on the results page about
+   30 s later.
+
+`--no-upload` plays the drive locally without AWS. On Windows, use `.venv\Scripts\python` instead of `.venv/bin/python`.
 
 ## How it works
 
