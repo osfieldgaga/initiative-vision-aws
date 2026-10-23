@@ -16,6 +16,8 @@ EnvironmentFile=/etc/lld.env
 # C++ libraries and ffmpeg need the loader path. systemd doesn't run activate, so set them here.
 Environment=PYTHONPATH=/opt/cool/python_3.12/site-packages/cv2/python-3.12
 Environment=LD_LIBRARY_PATH=/opt/cool/cpp_sdk/lib:/opt/ffmpeg/lib
+# print() lines go straight to journalctl instead of sitting in a buffer
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/opt/cool/venvs/python_3.12/bin/python lld_aws.py live
 Restart=on-failure
 RestartSec=5
