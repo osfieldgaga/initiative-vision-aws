@@ -19,7 +19,7 @@ uploads it through the real AWS pipeline, exactly like the car does; you watch t
    ```bash
    git clone https://github.com/osfieldgaga/initiative-vision-aws.git && cd initiative-vision-aws
    python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt     # Python 3.12 or 3.13
-   curl -L -O https://github.com/osfieldgaga/initiative-vision-aws/releases/download/judge-data/ivision-drive-20261022.zip
+   curl -L -O https://github.com/osfieldgaga/initiative-vision-aws/releases/download/v1.0/ivision-drive-20261022.zip
    python3 -m zipfile -e ivision-drive-20261022.zip .
    ```
 2. **Open the results page**, [www.initiativelabs.cc/ivision-demo](https://www.initiativelabs.cc/ivision-demo),
