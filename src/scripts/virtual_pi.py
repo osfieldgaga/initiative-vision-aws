@@ -26,10 +26,10 @@ have sent is sent from here, in the same format, so lld_aws.py needs no change. 
 URL (--queue-url or LLD_QUEUE_URL) and s3:PutObject on live/* + sqs:SendMessage on the queue.
 
 --demo (for judges): no AWS account needed. Asks for the demo password (or IVISION_DEMO_PASSWORD),
-gets one-hour upload credentials from https://initiativelabs.cc/api/ivision/credentials (limited
+gets one-hour upload credentials from https://www.initiativelabs.cc/api/ivision/credentials (limited
 to putting frames under live/ and sending to the frame queue, like the real Pi; renewed before
 they expire), which also starts the cloud side; then uploads in direct mode at 640 x 640. Watch
-the results at https://initiativelabs.cc/ivision-demo.
+the results at https://www.initiativelabs.cc/ivision-demo.
 
 Next to the frame, a CAN panel shows what the car was doing at that moment: speed, RPM,
 steering wheel angle, accelerator and brake pedal, and gear (PRNDL). It's read from the session's
@@ -53,6 +53,7 @@ import csv
 import getpass
 import json
 import urllib.error
+import urllib.parse
 import urllib.request
 import math
 import threading
@@ -78,7 +79,7 @@ POLL_S = 0.1                 # same as the Pi uploader
 MIN_UPLOAD_INTERVAL_S = 1.0  # at most 1 upload/s, same as the Pi
 JPEG_QUALITY = 70
 DISPLAY_SIZE = 640
-DEMO_SITE = "https://initiativelabs.cc"
+DEMO_SITE = "https://www.initiativelabs.cc"  # the bare domain redirects here (308)
 RENEW_BEFORE_S = 600       # renew --demo credentials this long before they expire
 SEEK_S = 10
 PANEL_W = 300
@@ -185,16 +186,21 @@ def upload_metadata(session_start, frame_time, frame_seq):
 def fetch_demo_credentials(site, password):
     """POST the demo password to the website; returns its JSON (temporary AWS credentials,
     region, bucket, queueUrl). Raises SystemExit with a readable message on failure."""
-    req = urllib.request.Request(f"{site}/api/ivision/credentials", method="POST",
-                                 data=json.dumps({"password": password}).encode(),
-                                 headers={"Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=30) as res:
-            return json.loads(res.read())
-    except urllib.error.HTTPError as e:
-        raise SystemExit("wrong demo password" if e.code == 401 else f"demo site error {e.code}: {e.read()[:200]!r}")
-    except urllib.error.URLError as e:
-        raise SystemExit(f"can't reach {site}: {e.reason}")
+    url = f"{site}/api/ivision/credentials"
+    for _ in range(3):  # urllib won't repeat a POST across a 307/308 redirect (bare domain -> www)
+        req = urllib.request.Request(url, method="POST", data=json.dumps({"password": password}).encode(),
+                                     headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as res:
+                return json.loads(res.read())
+        except urllib.error.HTTPError as e:
+            if e.code in (301, 302, 307, 308) and e.headers.get("Location"):
+                url = urllib.parse.urljoin(url, e.headers["Location"])
+                continue
+            raise SystemExit("wrong demo password" if e.code == 401 else f"demo site error {e.code}: {e.read()[:200]!r}")
+        except urllib.error.URLError as e:
+            raise SystemExit(f"can't reach {site}: {e.reason}")
+    raise SystemExit(f"too many redirects from {site}")
 
 
 class DemoCredentials:
