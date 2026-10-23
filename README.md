@@ -6,7 +6,7 @@ stop signs and speed limits, and shows them on a live page, about 1.2 to 1.4 s a
 captured the frame (measured from the Pi, 2026-10-22).
 
 Entry for the [OpenCV AI Competition 2026](https://opencv26.devpost.com).
-Report: *link to come*. Video: *link to come*. Live demo: [www.initiativelabs.cc/ivision-demo](https://www.initiativelabs.cc/ivision-demo) (password in the submission).
+Report: [docs/technical-report.pdf](docs/technical-report.pdf). Video: *link to come*. Live demo: [www.initiativelabs.cc/ivision-demo](https://www.initiativelabs.cc/ivision-demo) (password in the submission).
 
 > Not a safety system: it never controls the vehicle, and the driver must not rely on it.
 
