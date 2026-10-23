@@ -12,6 +12,10 @@ Wants=network-online.target
 User=ubuntu
 WorkingDirectory=/home/ubuntu/initiative-vision-aws
 EnvironmentFile=/etc/lld.env
+# what /opt/cool/venvs/python_3.12/bin/activate sets: COOL's cv2 lives outside the venv, and its
+# C++ libraries and ffmpeg need the loader path. systemd doesn't run activate, so set them here.
+Environment=PYTHONPATH=/opt/cool/python_3.12/site-packages/cv2/python-3.12
+Environment=LD_LIBRARY_PATH=/opt/cool/cpp_sdk/lib:/opt/ffmpeg/lib
 ExecStart=/opt/cool/venvs/python_3.12/bin/python lld_aws.py live
 Restart=on-failure
 RestartSec=5

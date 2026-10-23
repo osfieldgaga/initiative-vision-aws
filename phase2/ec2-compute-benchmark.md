@@ -25,7 +25,7 @@
 3. The script loads the model once per engine/target combination and runs one warm-up pass. It then times 5 forward passes and prints the median and the minimum. The input is random, because a conv net's cost doesn't depend on the pixel values.
 4. To check that accuracy holds on real frames, run `src/scripts/dnn_check.py <frames_dir> 30`. It times the configurations interleaved, frame by frame, and gives lane/drivable-area IoU and detection agreement against the new engine in FP32.
 
-**Stock OpenCV baseline:** the COOL AMI sets `PYTHONPATH=/opt/cool/python_3.12/site-packages/cv2/python-3.12` system-wide. That makes COOL's `cv2` win over any pip-installed OpenCV, even in a fresh venv. A first baseline attempt on 2026-10-22, in a new venv with `opencv-python-headless==5.0.0.93`, still loaded COOL's 5.1.0-dev, and its numbers were discarded. Run the baseline with the variable cleared, and check the version before trusting anything:
+**Stock OpenCV baseline:** COOL's venv `activate` script exports `PYTHONPATH=/opt/cool/python_3.12/site-packages/cv2/python-3.12` (and `LD_LIBRARY_PATH` for its C++ libraries), and the variable stays set in that shell. That makes COOL's `cv2` win over any pip-installed OpenCV, even in a fresh venv. A first baseline attempt on 2026-10-22, in a new venv with `opencv-python-headless==5.0.0.93`, still loaded COOL's 5.1.0-dev, and its numbers were discarded. Run the baseline with the variable cleared, and check the version before trusting anything:
 ```bash
 python -m venv ~/stock && ~/stock/bin/pip install opencv-python-headless==5.0.0.93 numpy
 env -u PYTHONPATH ~/stock/bin/python -c "import cv2; print(cv2.__version__, cv2.__file__)"  # 5.0.0, ~/stock/...
