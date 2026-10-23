@@ -447,3 +447,41 @@ class IdleStopTest(unittest.TestCase):
             self.assertTrue(idle.check(now=1950))       # 650 s: shut down
             self.assertFalse(idle.check(now=3000))      # only once
             run.assert_called_once_with(["true"], check=False)
+
+
+class DownloadTest(unittest.TestCase):
+    def test_videos_offered_after_finalize_and_redirected_to_presigned_url(self):
+        import urllib.error
+        import urllib.request
+        from live_view import LiveView
+        view = LiveView(port=0, presign=lambda key, name: f"https://s3.example/{key}?sig=1&name={name}").start()
+        try:
+            base = f"http://127.0.0.1:{view._server.server_address[1]}"
+            view.update(np.zeros((8, 8, 3), np.uint8), np.zeros((8, 8, 3), np.uint8), {"lane_valid": False}, session="S1")
+            self.assertEqual(json.loads(urllib.request.urlopen(base + "/metrics").read())["downloads"], [])
+
+            output = types.SimpleNamespace(session="S1", finalize=lambda: None,
+                                           videos=[{"frames": 3, "overlay": "lld/S1/overlay.mp4", "bev": "lld/S1/bev.mp4"}])
+            lld_aws.close_session(output, view)
+            downloads = json.loads(urllib.request.urlopen(base + "/metrics").read())["downloads"]
+            self.assertEqual([d["key"] for d in downloads], ["lld/S1/overlay.mp4", "lld/S1/bev.mp4"])
+
+            class NoRedirect(urllib.request.HTTPRedirectHandler):
+                def redirect_request(self, *a, **kw):
+                    return None
+            opener = urllib.request.build_opener(NoRedirect)
+            with self.assertRaises(urllib.error.HTTPError) as err:
+                opener.open(base + "/download?key=lld%2FS1%2Foverlay.mp4")
+            self.assertEqual(err.exception.code, 302)
+            self.assertTrue(err.exception.headers["Location"].startswith("https://s3.example/lld/S1/overlay.mp4"))
+            with self.assertRaises(urllib.error.HTTPError) as err:  # only keys it offered
+                opener.open(base + "/download?key=live%2FS1%2Fframe.jpg")
+            self.assertEqual(err.exception.code, 404)
+        finally:
+            view.stop()
+
+    def test_multi_part_sessions_label_each_part(self):
+        out = types.SimpleNamespace(videos=[{"overlay": "a1", "bev": "b1"}, {"overlay": "a2", "bev": "b2"}])
+        self.assertEqual([l for l, _ in lld_aws.video_downloads(out)],
+                         ["camera overlay video (part 1)", "bird's-eye video (part 1)",
+                          "camera overlay video (part 2)", "bird's-eye video (part 2)"])

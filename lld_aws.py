@@ -351,6 +351,23 @@ class MetricsPublisher:
         self.flush()
 
 
+def video_downloads(output):
+    """[(label, s3 key)] for every video part of a finalized SessionOutput."""
+    files = []
+    parts = output.videos
+    for n, part in enumerate(parts, start=1):
+        suffix = f" (part {n})" if len(parts) > 1 else ""
+        files += [(f"camera overlay video{suffix}", part["overlay"]), (f"bird's-eye video{suffix}", part["bev"])]
+    return [(label, key) for label, key in files if key]
+
+
+def close_session(output, live):
+    """Finalize a session (H.264 videos + metrics to S3) and offer its videos on the live page."""
+    output.finalize()
+    if live:
+        live.set_downloads(output.session, video_downloads(output))
+
+
 ## Idle auto-stop
 
 class IdleStop:
@@ -497,7 +514,7 @@ def run_live(s3, sqs, queue_url, model, device, work_dir, show=SHOW, live=None, 
             if not messages:
                 if current and time.time() - current.last_frame_at > SESSION_IDLE_S:
                     print(f"session {current.session}: no frames for {SESSION_IDLE_S}s, finalizing")
-                    current.finalize()
+                    close_session(current, live)
                     current = None
                     if live:
                         live.finish()
@@ -511,7 +528,7 @@ def run_live(s3, sqs, queue_url, model, device, work_dir, show=SHOW, live=None, 
 
                 if current is None or current.session != session:
                     if current:
-                        current.finalize()
+                        close_session(current, live)
                         current = None
                     try:
                         current = SessionOutput(s3, bucket, session, f"s3://{bucket}/live/{session}/",
@@ -631,8 +648,13 @@ def main(argv=None):
     live = None
     if LIVE_PORT:
         try:
+            def presign(key, filename):  # one-hour download link; the bucket itself stays private
+                return s3.generate_presigned_url(
+                    "get_object", ExpiresIn=3600,
+                    Params={"Bucket": BUCKET, "Key": key,
+                            "ResponseContentDisposition": f'attachment; filename="{filename}"'})
             live = LiveView(port=LIVE_PORT, departure_threshold=lld.DEPARTURE_THRESHOLD,
-                            token_secret=LIVE_TOKEN_SECRET).start()
+                            token_secret=LIVE_TOKEN_SECRET, presign=presign).start()
             if LIVE_TOKEN_SECRET:
                 print("live view: signed-token access check on")
         except OSError as e:

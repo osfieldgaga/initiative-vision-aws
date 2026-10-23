@@ -10,7 +10,8 @@ Endpoints:
     /             page with both streams + live metrics
     /overlay.mjpg camera overlay (MJPEG stream)
     /bev.mjpg     bird's-eye view (MJPEG stream)
-    /metrics      latest metrics as JSON
+    /metrics      latest metrics as JSON (+ "downloads" once the session's videos are uploaded)
+    /download?key=lld/<session>/<video>.mp4   redirect to a one-hour S3 link for that video
 
 Public demo (LIVE_TOKEN_SECRET set): behind Caddy on demo.initiativelabs.cc, every request needs a
 token signed with that secret -- "<expiry unix time>.<hex HMAC-SHA256(secret, expiry)>". The
@@ -27,6 +28,7 @@ import os
 import sys
 import threading
 import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import cv2 as cv
@@ -35,19 +37,29 @@ import cv2 as cv
 PAGE = """<!doctype html>
 <html><head><meta charset="utf-8"><title>LLD live</title>
 <style>
-  body { background:#111; color:#ddd; font-family:monospace; margin:16px; }
-  .row { display:flex; gap:16px; flex-wrap:wrap; align-items:flex-start; }
-  img { border:1px solid #333; max-width:100%; }
+  body { background:#111; color:#ddd; font-family:monospace; margin:12px; font-size:13px; }
+  /* three columns in one row: the two videos share the width, metrics get a narrower column */
+  .row { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr) minmax(260px,340px);
+         gap:12px; align-items:start; }
+  @media (max-width: 900px) { .row { grid-template-columns:minmax(0,1fr); } }
+  figure { margin:0; }
+  figcaption { color:#888; margin-bottom:4px; }
+  img { display:block; width:100%; height:auto; aspect-ratio:1 / 1; border:1px solid #333; background:#000; }
   table { border-collapse:collapse; }
-  td { padding:2px 10px 2px 0; }
+  td { padding:1px 8px 1px 0; vertical-align:top; }
+  p { margin:10px 0 4px; color:#888; }
   .bad { color:#f55; } .ok { color:#5d5; } .na { color:#888; }
-  canvas { background:#1a1a1a; border:1px solid #333; }
+  canvas { display:block; width:100%; height:auto; background:#1a1a1a; border:1px solid #333; }
+  #dl a { display:inline-block; margin:4px 6px 0 0; padding:6px 10px; border:1px solid #f56e0f;
+          color:#f56e0f; text-decoration:none; }
+  #dl a:hover { background:#f56e0f; color:#111; }
 </style></head>
 <body>
 <div class="row">
-  <img src="/overlay.mjpg" width="640" height="640">
-  <img src="/bev.mjpg" width="640" height="640">
+  <figure><figcaption>camera + lanes, vehicles, signs</figcaption><img src="/overlay.mjpg" alt="camera overlay"></figure>
+  <figure><figcaption>bird's-eye view</figcaption><img src="/bev.mjpg" alt="bird's-eye view"></figure>
   <div>
+    <div id="dl"></div>
     <table id="m"></table>
     <p>offset (m), last 200 frames</p>
     <canvas id="plot" width="400" height="160"></canvas>
@@ -77,9 +89,20 @@ function drawPlot() {
   });
 }
 
+function drawDownloads(m) {
+  const d = document.getElementById("dl");
+  if (m.downloads && m.downloads.length) {
+    d.innerHTML = "<p>session videos</p>" + m.downloads.map(f =>
+      `<a href="/download?key=${encodeURIComponent(f.key)}">⬇ ${f.label}</a>`).join("");
+  } else {
+    d.innerHTML = m.session ? `<p>videos: downloadable when the session ends (30 s after its last frame)</p>` : "";
+  }
+}
+
 async function poll() {
   try {
     const m = await (await fetch("/metrics")).json();
+    drawDownloads(m);
     if ((m.seq !== lastSeq || m.done !== lastDone) && m.metrics) {
       const isNewFrame = m.seq !== lastSeq;
       lastSeq = m.seq; lastDone = m.done;
@@ -164,11 +187,13 @@ class LiveView:
     """Holds the latest frames/metrics and serves them to any connected browser."""
 
     def __init__(self, host="127.0.0.1", port=8080, jpeg_quality=80, departure_threshold=0.4,
-                 token_secret=None):
+                 token_secret=None, presign=None):
         self.host = host
         self.port = port
         self.token_secret = token_secret  # None = no access check (localhost / SSH tunnel)
         self.last_request = 0.0           # time.time() of the last request, for the idle auto-stop
+        self.presign = presign            # (key, filename) -> temporary download URL; None = no downloads
+        self._downloads = {}              # session -> [{"label", "key"}] once its videos are uploaded
         self.jpeg_quality = jpeg_quality
         self.page = PAGE.replace("__DEP__", str(departure_threshold)).encode()
 
@@ -216,12 +241,28 @@ class LiveView:
                     self._send(200, "text/html; charset=utf-8", view.page)
                 elif path == "/metrics":
                     with view._cond:
-                        body = json.dumps(view._info).encode()
+                        info = {**view._info, "downloads": view._downloads.get(view._info.get("session"), [])}
+                        body = json.dumps(info).encode()
                     self._send(200, "application/json", body)
+                elif path == "/download":
+                    self._download()
                 elif path in ("/overlay.mjpg", "/bev.mjpg"):
                     view._stream(self, path[1:].split(".")[0])
                 else:
                     self._send(404, "text/plain", b"not found")
+
+            def _download(self):
+                query = self.path.split("?", 1)[1] if "?" in self.path else ""
+                key = urllib.parse.parse_qs(query).get("key", [""])[0]
+                with view._cond:
+                    allowed = {f["key"] for files in view._downloads.values() for f in files}
+                if not view.presign or key not in allowed:
+                    self._send(404, "text/plain", b"no such video")
+                    return
+                self.send_response(302)
+                self.send_header("Location", view.presign(key, key.replace("/", "_")))
+                self.send_header("Content-Length", "0")
+                self.end_headers()
 
             def _send(self, code, ctype, body):
                 self.send_response(code)
@@ -278,6 +319,11 @@ class LiveView:
                 self._jpegs["bev"] = bev_jpg.tobytes()
             self._info = {"seq": self._seq, "metrics": metrics, "done": False, **info}
             self._cond.notify_all()
+
+    def set_downloads(self, session, files):
+        """files: [(label, s3 key)] of a finalized session's videos, offered on the page."""
+        with self._cond:
+            self._downloads[session] = [{"label": label, "key": key} for label, key in files]
 
     def finish(self):
         """Mark the run as finished; the last frame stays visible while the server is up."""
