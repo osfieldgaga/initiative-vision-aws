@@ -1,111 +1,64 @@
-# Video script: Initiative Vision (target 4:40, hard limit 5:00)
+# Video script: Initiative Vision (target 1:50, hard limit 2:00)
 
 The rules ask the video to show **the team, the application working, its architecture, and its principal
-results**. Each of those has its own scene below. Narration is written to be read at a calm pace
-(~150 words per minute); the times are cumulative.
+results**. One scene each, plus a hook and a close. Narration is ~250 words, about 1:45 at a brisk but
+clear ~150 words per minute; the times are cumulative.
 
-**Recording setup:** OBS (or any screen recorder) at 1920x1080. For the demo scenes, put the virtual Pi
-window on the left half of the screen and `www.initiativelabs.cc/ivision-demo` on the right half, with
-the instance already started (press Start ~2 minutes before recording). Use the judges' drive:
-`python src/scripts/virtual_pi.py test_sessions/private-640/20261022T164127Z-084b --demo --start <s>`.
-Useful moments in that drive:
+**Recording setup:** OBS (or any screen recorder) at 1920x1080. For the demo scene, put the virtual Pi
+window on the left half of the screen and `www.initiativelabs.cc/ivision-demo` on the right, with the
+instance already started (press Start ~2 minutes before recording). Run:
+`python src/scripts/virtual_pi.py test_sessions/private-640/20261022T164127Z-084b --demo --start 165`
+(right blinker, then the stop sign at 2:51 of the drive). Record ~40 s of it and cut to the best 30 s.
 
-| Drive time | `--start` | What happens |
-|---|---|---|
-| 2:44-3:01 | 160 | right blinker, then a stop sign at 2:51 (detected on the results page) |
-| 4:50-5:09 | 285 | left blinker, then a stop sign at 4:56 |
-| 5:27-6:12 | 327 | longest stretch above 20 mph: clean lane tracking, offset plot |
+**Editing tip:** let the screen do the talking. Show each number as a big title card while you say it;
+no scene should hold one static shot for more than ~8 s.
 
 ---
 
-## 1. Hook and team (0:00-0:25)
+## 1. Hook and team (0:00-0:12)
 
-**On screen:** you, in or next to the 2014 Malibu, Pi and camera visible on the dash. Lower-third title:
+**On screen:** you next to the 2014 Malibu, the Pi and camera on the dash. Lower third:
 "Osfield Gaga · Initiative Labs".
 
-**Narration:**
-> I'm Osfield, and this is Initiative Labs. My car is a 2014 Chevy Malibu: no lane assist, no sign
-> recognition, nothing. So I put a Raspberry Pi and a camera on the dashboard, and let the cloud do the
-> seeing. This is Initiative Vision, for the OpenCV AI Competition 2026.
+> My 2014 Malibu has no driver assistance at all. So I gave it a Raspberry Pi, a camera, and the cloud.
+> I'm Osfield from Initiative Labs, and this is Initiative Vision.
 
-## 2. The device (0:25-0:50)
+## 2. It working (0:12-0:52)
 
-**On screen:** close-ups: the Pi 3B, the camera, the CAN connection under the dash. Optional: the launcher
-terminal starting the recorder and uploader.
+**On screen:** split screen, virtual Pi left, results page right. Zoom in on the stop sign when it's flagged.
 
-**Narration:**
-> The Vision 1 is deliberately small: a Raspberry Pi 3 with one gigabyte of RAM. It records the road at
-> 1280 by 1280, logs the car's CAN bus, and about once a second sends a small 640-pixel frame to AWS.
-> That's all the Pi is allowed to do. Everything else happens in the cloud.
+> The Pi only records and sends a small frame to AWS every second. Here, the virtual Pi replays a real
+> drive, with the car's own CAN data: speed, gear, steering, pedals, blinker. On the right, what comes
+> back from AWS, just over a second later: the road, the lane lines, the vehicles, a bird's-eye view with my
+> position in the lane, and here, a stop sign, read and flagged. Judges can run this exact demo
+> themselves, no car and no AWS account needed.
 
-## 3. It working (0:50-1:55)
+## 3. Architecture (0:52-1:17)
 
-**On screen:** the virtual Pi (left) and the results page (right), `--start 160`. Let it run through the
-right turn and the stop sign at 2:51 (about 25 s of drive), then cut to `--start 327` for ~15 s of
-cruising. Point at things as you name them (cursor or a zoom in the edit).
+**On screen:** `docs/architecture.png`, slow zoom from the Pi to the EC2 box; 2 s of the CloudWatch
+dashboard (`docs/cloudwatch.png`) at the end.
 
-**Narration:**
-> For this demo, the virtual Pi replays a real drive from my car, on my laptop, at real speed, and uploads
-> it exactly like the car does. On the left, the camera with the car's own data from the CAN bus: speed,
-> gear, the steering wheel, the pedals, the blinker. On the right, what comes back from AWS: the drivable
-> road in green, the lane lines in red, the vehicles boxed, and a bird's-eye view with my position in the
-> lane. Here I'm turning right, and there's the stop sign: the cloud reads it and flags STOP. On a straight
-> road, the offset plot tracks how centred I am, and it would warn me if I drifted out of my lane. Judges
-> can do exactly this: download the drive, open the demo page, and run the virtual Pi themselves.
+> Each frame goes to S3 and an SQS queue. A Graviton instance running COOL, the Cloud Optimized OpenCV
+> image, runs the whole pipeline in OpenCV 5: undistortion, a lane and vehicle network on OpenCV's DNN
+> module, a bird's-eye view I calibrated with traffic cones, and a sign reader built from scratch.
+> Everything is monitored in CloudWatch.
 
-## 4. Architecture (1:55-2:45)
+## 4. Results (1:17-1:47)
 
-**On screen:** `docs/architecture.png`, building up one box at a time (or a slow pan), then a few seconds
-of the CloudWatch dashboard (`docs/cloudwatch.png`).
+**On screen:** title cards, one per line.
 
-**Narration:**
-> Here's the path of every frame. The Pi uploads it to S3 and puts a message on an SQS queue. A Graviton
-> EC2 instance running COOL, the Cloud Optimized OpenCV image, picks it up, runs the whole vision pipeline
-> in OpenCV 5, and streams the result to the live page, while the videos and per-frame metrics go back to
-> S3. Every frame's latency, inference time and lane quality goes to CloudWatch. Each piece has its own
-> minimal permissions; the website starts the instance through Vercel's OIDC federation, with no stored
-> keys, and the instance switches itself off after twenty idle minutes.
+> Camera to result: about 1.3 seconds, down from 3.2.
+> Inference: 0.74 seconds on 4 Graviton cores, faster than the original PyTorch model, and 0.22 on 16.
+> Lanes: when it sees both lines, it's right 98 percent of the time.
+> Stop signs: zero false alarms in 8,000 frames.
 
-## 5. OpenCV 5 inside (2:45-3:35)
+## 5. Close (1:47-1:57)
 
-**On screen:** quick cuts, ~8 s each: the cone square calibration photo (`data/images/w6l6.jpg` and its
-warped view); an overlay frame with lanes and boxes; a sign crop with the OCR reading ("stoe" -> STOP);
-a few lines of `lld.py` / `signs.py` if you like.
+**On screen:** a before/after privacy frame for 2 s, then the two URLs: the demo page and the GitHub repo.
 
-**Narration:**
-> Inside, it's OpenCV 5 end to end. The frame is undistorted with my camera's calibration. YOLOPv2, a
-> lane and vehicle network, runs on OpenCV's DNN module: I exported it to ONNX and checked it gives exactly
-> the same output as the original PyTorch model. A homography I calibrated with traffic cones turns the
-> lane mask into a bird's-eye view in real metres. And the sign reader is built from scratch: colour and
-> shape find the candidates, OpenCV's text recognizer reads them, and instead of trusting the raw OCR, I
-> score how likely it is to say "stop" or a legal speed limit. A blurry "stoe" still counts as STOP; random
-> shapes never do.
-
-## 6. Results (3:35-4:25)
-
-**On screen:** simple title cards, one per number (or the tables from the report).
-
-**Narration:**
-> The results. End to end, from the camera to the result on screen: about one point three seconds, down
-> from three point two, once I found that over a second was just S3 notifying Lambda, and had the Pi
-> queue its frames directly. Inference: point seven four seconds on four Graviton cores, point two two on
-> sixteen, faster than the original PyTorch model. COOL against standard OpenCV on the same machine? An
-> honest tie for this model. Lanes, against frames I labelled by hand: when it says it sees both lines,
-> it's right ninety-eight percent of the time. Stop signs: zero false alarms in eight thousand frames.
-> And it has limits: it misses about a quarter of visible lanes, the detector only knows vehicles, and
-> speed limits were only tested on synthetic signs so far.
-
-## 7. Responsible use and what's next (4:25-4:50)
-
-**On screen:** a before/after privacy frame (from the review folder), then the demo page URL and the repo URL.
-
-**Narration:**
-> It never controls the car, and the data I share is anonymised: faces and plates blurred, GPS and the VIN
-> removed. Next: alerts on a small screen back in the car, getting under a second, and using all this
-> data to tune my vehicle simulation. Everything is open source. Thanks for watching.
+> It never controls the car, and shared data is anonymised. Everything is open source. Try it yourself.
 
 ---
 
-**If it runs long, cut in this order:** scene 2's optional terminal shot; the second demo segment
-(`--start 327`); the code close-ups in scene 5. Keep scenes 1, 3, 4 and 6: they are the four things the
-rules ask for.
+**If it runs long:** drop the CAN list in scene 2 ("speed, gear, steering, pedals, blinker") and the
+CloudWatch sentence in scene 3. Never cut scenes 1-4: they are the four things the rules ask for.
