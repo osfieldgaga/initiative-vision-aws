@@ -165,6 +165,10 @@ After the drive:
 - [ ] **In-car OLED display** (shelved 2026-10-22, not a priority): an SSD1306/SH1106 over I2C on the Pi showing lane offset and departure as the main view, STOP and the speed limit held for 5 s, and "NO DATA" when results go stale. Results come back through a second SQS queue (`lld-results`) that EC2 writes per frame and the Pi long-polls. About 1.1 s behind the road, so it's informative only. Estimate 2–3 h, with a fake-screen mode for testing on the laptop.
 - [ ] **Forward collision warning** (stretch): the bottom-center of each vehicle box is on the road, so `cv.perspectiveTransform` with the BEV homography `lld.M` gives its distance ahead (y=700 is 4.874 m from the car) and its lateral position (in-lane or not). Then warn on distance or on its change between frames (time-to-collision). Caveats: the ground-plane assumption breaks on hills, and the homography was calibrated only out to ~7 m, so far estimates are rough. Car speed isn't uploaded live, so TTC would come from vision only.
 
+## Submission write-up
+
+- [x] ~~Devpost "About the project" text~~: done 2026-10-23, `phase2/devpost-about.md` (paste into the form)
+
 ## 8. Scope decisions to make now (5 days left)
 
 The Phase 2 brief (scenario mining, MCP agent, pseudo-label panels, MATLAB) is far beyond what fits in 5 days. Suggested cut, to be confirmed:
